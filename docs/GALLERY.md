@@ -1,45 +1,43 @@
 # AC TV en imágenes
 
-Capturas de la interfaz real renderizada en Chromium con datos de demostración. No son fotografías de la Samsung ni pruebas de que una emisión concreta esté disponible. Los identificadores de demostración son sintéticos.
+Capturas de la interfaz renderizada en escritorio con datos sintéticos. No son fotografías de una TV ni evidencias de disponibilidad de emisiones. Los nombres “Fútbol1” y “Campeones1” son ficticios y los identificadores son sintéticos y no funcionales.
 
 ## Inicio
 
-Favoritos y categorías al abrir la aplicación.
-
 ![Inicio](images/home.png)
 
-## Catálogo
+## Canales de demostración
 
-Tarjetas con logos locales y navegación mediante flechas.
-
-![Catálogo](images/channels.png)
+![Canales](images/channels.png)
 
 ## Selección
 
-Contorno redondeado que rodea toda la tarjeta.
-
 ![Selección](images/selection.png)
 
-## Mis favoritos
+## Favoritos
 
-Una sección para los canales que eliges guardar.
+![Favoritos](images/favorites.png)
 
-![Mis favoritos](images/favorites.png)
+## Búsqueda
 
-## Buscar por nombre
-
-Campo de búsqueda para encontrar canales sin recorrer todo el catálogo.
-
-![Buscar por nombre](images/search.png)
+![Buscar](images/search.png)
 
 ## Resultados
 
-Coincidencias sobre el catálogo guardado en la TV.
-
 ![Resultados](images/search-results.png)
 
-## Carga sencilla
+## Carga
 
-Nombre del canal y animación; la aplicación gestiona la conexión.
+![Carga](images/loading.png)
 
-![Carga sencilla](images/loading.png)
+Las imágenes que muestran canales usan nombres genéricos. No contienen logos de canales reales ni material promocional de TV de pago. La galería no representa un catálogo incluido: la versión pública empieza vacía.
+
+## Primer uso y enlaces propios
+
+La bienvenida informa de que no se incluyen canales y explica la responsabilidad del usuario.
+
+![Uso responsable](images/onboarding-welcome.png)
+
+El formulario permite guardar un enlace propio con un nombre. No contiene enlaces precargados.
+
+![Añadir un canal](images/add-link.png)

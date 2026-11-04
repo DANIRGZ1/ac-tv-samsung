@@ -1,17 +1,17 @@
-# Reconstrucción
+# Reconstrucción y empaquetado
 
-La aplicación usa un Worker WebAssembly para red P2P, entrega bytes al servidor HTTP de bucle local de la TV y reproduce su URL mediante AVPlay. Los mensajes técnicos se conservan en diagnósticos, no en la pantalla de carga.
+La aplicación integra una interfaz Tizen, un motor P2P WebAssembly y reproducción mediante AVPlay. Los runtimes precompilados incluidos permiten empaquetar sin reconstruir Rust ni el puente Samsung.
 
-Para empaquetar basta el árbol `work/acetv-native-app` y los runtimes precompilados incluidos. El script build-native-app reúne los componentes y genera un WGT sin firmar. Si se configura TIZEN_SECURITY_PROFILE, intenta firmar con la CLI local. No se incluyen claves, perfiles ni certificados personales.
+Desde la raíz del repositorio:
 
-Para reconstruir el motor Rust instala el toolchain nightly indicado, target wasm32-unknown-unknown y wasm-bindgen 0.2.105 en la ruta del script build-wire-probe. Ese script compila las dependencias locales de Outpace y genera el runtime `ace_wire`.
+```powershell
+pwsh -File work/build-native-app.ps1
+```
 
-Para recompilar sockets/servidor de bucle local, instala el SDK WebAssembly de Samsung en `work/toolchain/samsung-emscripten/emscripten-release-bundle/emsdk`. La configuración Python usa rutas relativas al propio repositorio. Ejecuta build-live-probe después del motor Rust. Este SDK antiguo no forma parte del repositorio; no se afirma compatibilidad con Emscripten genérico moderno.
+El resultado es un WGT sin firmar. Para firmar e instalar necesitas Tizen Studio, extensiones Samsung y certificados propios válidos para el televisor. No se incluyen claves ni perfiles. Consulta [Instalación](INSTALL.md).
 
-Firma e instalación: utiliza tus propios certificados Samsung. La identidad de ejemplo del paquete público es AcTVPublic.AceTV. No modifica firmware, no requiere root y no desactiva protecciones.
+La reconstrucción de componentes requiere Rust nightly-2026-03-15, wasm-bindgen 0.2.105 y el SDK WebAssembly de Samsung compatible con sockets Tizen. El SDK no se redistribuye. Los scripts `work/build-wire-probe.ps1` y `work/build-live-probe.ps1` describen las rutas de reconstrucción.
 
-## Diagnósticos
+El código del motor conserva avisos y licencias upstream; consulta `LICENSE` y `NOTICE.txt`. No se afirma que la versión pública 0.11.0 haya sido instalada físicamente en una TV. La base del motor Tizen 6.5 se comprobó previamente; la versión pública se probó en escritorio.
 
-AceTV.diagnostics() expone el estado del reproductor, el último error y el transporte. AceCatalog.diagnostics() muestra sección, cantidad de canales y favoritos. No hace falta abrir estos diagnósticos para usar la TV.
-
-Los tests TLS de Outpace contienen certificados y una clave de prueba ya públicos en su upstream; son fixtures de pruebas, no credenciales del propietario de esta aplicación.
+Al solicitar explícitamente la reproducción de un enlace, el motor puede consultar servicios externos de metadatos, DNS, trackers y pares para resolverlo. Esas conexiones son distintas de descargar un listado de canales; no verifican que el contenido tenga autorización y pueden comunicar la IP y el identificador del enlace a terceros.

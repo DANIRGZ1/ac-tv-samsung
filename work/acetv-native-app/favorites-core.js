@@ -32,7 +32,7 @@
       key = '$' + id;
       if (seen[key]) continue;
       seen[key] = true;
-      result.push({ id: id, name: cleanName(entry.name) });
+      var item={id:id,name:cleanName(entry.name)};if(entry.kind==='content_id')item.kind='content_id';result.push(item);
     }
     return result;
   }

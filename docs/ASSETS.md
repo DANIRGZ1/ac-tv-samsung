@@ -1,10 +1,7 @@
 # Recursos visuales
 
-- assets/stadium.png: generado con la herramienta integrada de imágenes. Prompt: estadio de fútbol panorámico al anochecer; campo a la derecha, izquierda naturalmente oscura para texto; sin texto, interfaz ni logos.
-- assets/categories.png: atlas fotográfico 2×2 de proporción total 8:3, fútbol con balón y estadio, tenis de tierra con pelota amarilla, paisaje cinematográfico ámbar con excursionista y redacción de noticias azul; sin texto, interfaz ni logos. Generado con la misma herramienta.
-- assets/logos: imágenes identificativas procedentes de tv-logo/tv-logos. La ruta y URL originales se registran en SOURCES.json. Los derechos sobre las marcas siguen perteneciendo a sus titulares.
-- docs/images: capturas en Chromium de la aplicación con datos sintéticos. No son fotografías de una TV ni capturas del panel físico de Samsung.
+- `work/acetv-native-app/assets/stadium.png`: fondo generado para el proyecto, sin texto ni logos.
+- `work/acetv-native-app/assets/categories.png`: imágenes genéricas de categorías, sin texto ni logos.
+- `docs/images/`: capturas y composición de portada con interfaz y datos sintéticos. Los nombres de demostración incluyen “Fútbol1” y “Campeones1”; los IDs no son funcionales.
 
-## Presentación del repositorio
-
-La portada cover.png es una composición creada en HTML/CSS con una captura real de la interfaz de demostración. La galería se renderizó con Chromium a 1920×1080 y datos sintéticos; la portada mide 1600×900. No se conectó a emisiones ni se capturaron datos del usuario para estas imágenes.
+La versión pública no incluye logotipos de canales ni recursos promocionales de TV de pago. Las imágenes de galería no prueban disponibilidad de contenidos ni representan canales reales.

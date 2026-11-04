@@ -1,11 +1,11 @@
 # Presentación del repositorio
 
-Descripción corta propuesta para About:
+Descripción sugerida:
 
-> Reproductor para Samsung Tizen con motor P2P integrado, búsqueda, favoritos y logos. Control con mando, sin Ace Stream abierto en el PC.
+> Reproductor experimental para Samsung Tizen. Añade manualmente enlaces Ace Stream autorizados; búsqueda local y favoritos.
 
-Temas sugeridos: samsung, tizen, smart-tv, acestream, p2p, webassembly, avplay, tv-app.
+Temas sugeridos: samsung, tizen, smart-tv, acestream, p2p, webassembly, avplay.
 
-Portada del README: images/cover.png. Para usarla también como vista previa social, el propietario puede cargarla en Settings → General → Social preview del repositorio.
+La portada del README es `docs/images/cover.png`; la galería enlaza a `docs/GALLERY.md`. La descripción y la vista previa social son ajustes separados de GitHub.
 
-La descripción lateral y la vista previa social son ajustes de GitHub separados del README. El conector utilizado permite publicar los archivos; no ofrece una operación para modificar esos ajustes.
+La versión pública empieza sin catálogo y no ofrece búsqueda de directorios externos ni importación de catálogo desde PC. No incluye logos de canales ni material promocional de TV de pago. Consulta [Uso responsable](RESPONSIBLE_USE.md).
