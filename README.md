@@ -19,6 +19,20 @@
 
 > **Experimental · Instalación en modo desarrollador.** Comprobada en un Samsung con Tizen 6.5. No está publicada en Samsung Apps; la compatibilidad con otros modelos aún debe verificarse.
 
+## ¿Necesito una lista de canales?
+
+**No es obligatorio aportar una lista propia.** En la versión actual puedes usar el catálogo público que descarga AC TV o abrir un enlace Ace Stream individual.
+
+| Forma de usarla | Qué tienes que aportar |
+| --- | --- |
+| **Catálogo de la aplicación** | Conexión a Internet. En la bienvenida, pulsa **Preparar mis canales**; AC TV consulta el buscador público de Ace Stream y guarda los resultados en la TV. |
+| **Enlace propio** | Un enlace `acestream://…` o un identificador compatible de 40 caracteres. Abre **Ajustes → Abrir un enlace**, pégalo y pulsa **Reproducir**. |
+| **Lista M3U o URL de proveedor** | **Todavía no se puede importar directamente.** No es un requisito de instalación ni una función disponible en la versión 0.10.0. |
+
+La instalación añade el reproductor y su motor. El catálogo se obtiene después desde Internet; no hay una lista personal de canales incluida en el paquete. Que un canal aparezca en el catálogo no garantiza que esté emitiendo o que su enlace funcione.
+
+Para reproducir desde la Samsung no necesitas mantener Ace Stream abierto en el ordenador. El ordenador se usa para firmar e instalar la app; la opción de importar un catálogo desde el PC es un respaldo opcional.
+
 ## Tu televisión, a tu manera
 
 AC TV reúne el catálogo, tus favoritos y el reproductor en una interfaz pensada para una pantalla grande. Busca por nombre, explora categorías y elige con las flechas del mando. La conexión se gestiona por dentro: mientras abre la emisión, solo ves el nombre del canal y «Cargando canal…».
