@@ -1,0 +1,50 @@
+[package]
+name = "ace-engine"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "outpace"
+path = "src/main.rs"
+
+[lib]
+name = "ace_engine"
+path = "src/lib.rs"
+
+[dependencies]
+ace-log = { path = "../ace-log" }
+ace-wire = { path = "../ace-wire" }
+ace-media = { path = "../ace-media" }
+ace-swarm = { path = "../ace-swarm" }
+ace-peer = { path = "../ace-peer" }
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+async-trait = "0.1"
+axum = "0.8"
+clap = { version = "4", features = ["derive"] }
+tower = { version = "0.5", features = ["util"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+rand = "0.10"
+rtmp-rs = "0.6"
+base64ct = { version = "1.8", features = ["alloc"] }
+hex = "0.4"
+libc = "0.2"
+
+# jemalloc is the default global allocator on 64-bit non-MSVC targets (see main.rs). 32-bit targets
+# (e.g. armv7) are excluded: jemalloc's 64-bit `ffs` helper needs a `__ffsdi2` builtin that fails to
+# link against static 32-bit musl. The `background_threads` feature builds jemalloc with the purge
+# thread that returns freed pages to the OS while idle; `unprefixed_malloc_on_supported_platforms`
+# lets it back the global allocator. `tikv-jemalloc-ctl` powers `/debug/memstats`.
+[target.'cfg(all(not(target_env = "msvc"), target_pointer_width = "64"))'.dependencies]
+tikv-jemallocator = { version = "0.7", features = ["background_threads", "unprefixed_malloc_on_supported_platforms"] }
+tikv-jemalloc-ctl = { version = "0.7", features = ["stats"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+sha1 = "0.11"
+ace-tracker = { path = "../ace-tracker" }

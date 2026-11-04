@@ -1,0 +1,12 @@
+# Third-party reference repos and large binary engine artifacts (not ours)
+/references/
+
+# Scratch / build
+/target/
+*.log
+
+# Phase-0 reverse-engineering working artifacts (raw/derived, not committed)
+/re/
+
+# Local AceStream content-id registry (LLM context only, never committed)
+/acestream-ids.txt

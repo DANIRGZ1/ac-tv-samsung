@@ -1,0 +1,8 @@
+{
+  "host": "127.0.0.1",
+  "port": 18681,
+  "targetHash": "d9f5ebc83074e153f20e93d0a128cc51627331c3",
+  "descriptorBase64": "QWNlU3RyZWFtVHJhbnNwb3J0AAJJPutWVYcu6KpFqotiPEFP0CZtujyCUV/CpGmf8qA6mS6IjO05ydZsUocGWYd7G8ow8gu8YlVHYdKyPFFsCLYNEwXwtvIa5sip09gIxb4UDbnoTrIxKP1uYVvvsCDX0al79lx0fM8QKEE9RTwU5tqbYCBTujz+c0TgN8DlP9ts4+GAo11ZEW4nILKxVFvEhzIOx7sZxtKl91RpQzlUkSQZVUt81ewo9CZGGU55+n5Xpmk09cd/RbKeeRcds/NlpsZO7+eVzrX3MKUAyKs4t55R4L68Sdvm2DbrUK4FAjtaUIjBOD42RVWOSo5zF8/JmFet2bRGLc2/1ue0AbZg5kl/t3L3fhD616FtrhL9ZNXmBZCL7Are2oqGLiX16clhWCj6nGkVX1DRbWZWufOpVssni6IeRsgrz+buC0SxifnhPw==",
+  "expectedPieces": 52,
+  "expectedMediaBytes": 3401216
+}

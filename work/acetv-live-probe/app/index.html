@@ -1,0 +1,5 @@
+<!doctype html><html lang="es"><meta charset="utf-8"><title>Ace TV Live Probe</title>
+<style>body{margin:0;background:black;color:white;font:24px sans-serif}video,#avplay{width:100vw;height:100vh}#avplay{display:none}#overlay{position:absolute;left:30px;top:25px;background:rgba(0,0,0,.8);padding:18px;max-width:90vw}pre{font-size:21px;white-space:pre-wrap}</style>
+<video id="player" autoplay playsinline></video><object id="avplay" type="application/avplayer"></object><div id="overlay"><strong>Ace TV · Receptor P2P de prueba</strong><pre id="status">Conectando…</pre><small>Emisión sintética de laboratorio. Motor en desarrollo.</small></div>
+<canvas id="canvas" width="1" height="1" style="display:none"></canvas>
+<script src="$WEBAPIS/webapis/webapis.js"></script><script src="vendor/mux.min.js"></script><script src="ts-gop-splitter.js"></script><script src="ts-player.js"></script><script src="native-player.js"></script><script src="main.js"></script><script src="network.js"></script></html>

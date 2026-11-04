@@ -1,0 +1,1462 @@
+//! Async peer session over any AsyncRead+AsyncWrite stream.
+use crate::{PeerError, Result};
+use ace_wire::handshake::{
+    Handshake, HandshakeProtocol, BITTORRENT_HANDSHAKE_LEN, HANDSHAKE_LEN, HANDSHAKE_PREFIX_LEN,
+};
+use ace_wire::message::PeerMessage;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+/// Default ceiling for any single peer I/O operation (connect, handshake, read).
+///
+/// Without this, a stalled peer that holds the connection open but sends nothing
+/// would block a session task indefinitely — a real hazard once swarm orchestration
+/// fans out across many flaky peers.
+pub const DEFAULT_PEER_TIMEOUT: Duration = Duration::from_secs(20);
+const INBOUND_PEER_ID_GRACE: Duration = Duration::from_millis(20);
+
+/// Outgoing basic-handshake progress, retained by the caller if it cancels the exchange.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandshakeProgress {
+    /// The entire local handshake has been written.
+    Sent,
+    /// Cumulative bytes consumed into the ACE reply buffer, in 1..=66.
+    /// Standard BitTorrent handshakes emit only [`Self::Sent`].
+    ReplyBytes { received: usize },
+}
+
+// Observe inside poll_read: read_exact can consume a prefix and return Pending in
+// the same poll, after which an outer timeout can drop it without another await.
+struct ReplyProgressReader<'a, S, F> {
+    stream: &'a mut S,
+    observe: &'a mut F,
+    received: usize,
+}
+
+impl<S: AsyncRead + Unpin, F: FnMut(HandshakeProgress)> AsyncRead
+    for ReplyProgressReader<'_, S, F>
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let result = Pin::new(&mut *this.stream).poll_read(cx, buf);
+        let added = buf.filled().len() - before;
+        if added > 0 {
+            this.received += added;
+            (this.observe)(HandshakeProgress::ReplyBytes {
+                received: this.received,
+            });
+        }
+        result
+    }
+}
+
+pub struct PeerSession<S> {
+    stream: S,
+    /// Bytes read from the stream but not yet consumed into a message.
+    buf: Vec<u8>,
+    /// Ceiling applied to each individual I/O await (handshake, send, read).
+    timeout: Duration,
+    protocol: HandshakeProtocol,
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
+    pub fn new(stream: S) -> Self {
+        PeerSession {
+            stream,
+            buf: Vec::with_capacity(32 * 1024),
+            timeout: DEFAULT_PEER_TIMEOUT,
+            protocol: HandshakeProtocol::default(),
+        }
+    }
+
+    /// Override the per-operation I/O timeout.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Select the transport's peer handshake protocol before starting an exchange.
+    /// New sessions default to AceStream for existing live, metadata and wrapped VOD callers.
+    pub fn with_protocol(mut self, protocol: HandshakeProtocol) -> Self {
+        self.protocol = protocol;
+        self
+    }
+
+    /// Send our handshake, read the peer's, and verify the infohash matches.
+    pub async fn perform_handshake(
+        &mut self,
+        infohash: [u8; 20],
+        peer_id: [u8; 20],
+    ) -> Result<Handshake> {
+        self.perform_handshake_with_observer(infohash, peer_id, || {})
+            .await
+    }
+
+    /// Like [`Self::perform_handshake`], notifying `on_sent` once our entire handshake
+    /// has been written, before awaiting the reply. The caller can retain this progress
+    /// when an outer deadline cancels the exchange. No peer data is passed to the observer.
+    pub async fn perform_handshake_with_observer(
+        &mut self,
+        infohash: [u8; 20],
+        peer_id: [u8; 20],
+        on_sent: impl FnOnce(),
+    ) -> Result<Handshake> {
+        let mut on_sent = Some(on_sent);
+        self.perform_handshake_with_progress_observer(infohash, peer_id, |event| {
+            if event == HandshakeProgress::Sent {
+                if let Some(on_sent) = on_sent.take() {
+                    on_sent();
+                }
+            }
+        })
+        .await
+    }
+
+    /// Like [`Self::perform_handshake`], observing the completed local write and
+    /// strictly increasing ACE reply byte counts, bounded by the 66-byte reply.
+    /// These count consumed bytes, without implying remote acceptance or a valid reply.
+    /// Byte events run synchronously while reading,
+    /// before cancellation can discard a partially consumed reply. This does not
+    /// make resuming a canceled handshake safe. Standard BitTorrent emits only Sent.
+    pub async fn perform_handshake_with_progress_observer(
+        &mut self,
+        infohash: [u8; 20],
+        peer_id: [u8; 20],
+        mut observe: impl FnMut(HandshakeProgress),
+    ) -> Result<Handshake> {
+        if self.protocol == HandshakeProtocol::BitTorrent {
+            return self
+                .perform_bittorrent_handshake(infohash, peer_id, || {
+                    observe(HandshakeProgress::Sent)
+                })
+                .await;
+        }
+        let ours = Handshake::new(infohash, peer_id);
+        let timeout = self.timeout;
+        with_timeout(timeout, self.stream.write_all(&ours.encode())).await??;
+        observe(HandshakeProgress::Sent);
+        let mut hs = [0u8; HANDSHAKE_LEN];
+        let mut reader = ReplyProgressReader {
+            stream: &mut self.stream,
+            observe: &mut observe,
+            received: 0,
+        };
+        with_timeout(timeout, reader.read_exact(&mut hs)).await??;
+        let peer = Handshake::decode(&hs)?;
+        if peer.infohash != infohash {
+            return Err(PeerError::InfohashMismatch);
+        }
+        Ok(peer)
+    }
+
+    async fn perform_bittorrent_handshake(
+        &mut self,
+        infohash: [u8; 20],
+        peer_id: [u8; 20],
+        on_sent: impl FnOnce(),
+    ) -> Result<Handshake> {
+        let ours =
+            Handshake::new(infohash, peer_id).encode_with_protocol(HandshakeProtocol::BitTorrent);
+        let timeout = self.timeout;
+        with_timeout(timeout, self.stream.write_all(&ours)).await??;
+        on_sent();
+        let mut hs = [0u8; BITTORRENT_HANDSHAKE_LEN];
+        with_timeout(timeout, self.stream.read_exact(&mut hs)).await??;
+        let peer = Handshake::decode_with_protocol(&hs, HandshakeProtocol::BitTorrent)?;
+        if peer.infohash != infohash {
+            return Err(PeerError::InfohashMismatch);
+        }
+        Ok(peer)
+    }
+
+    /// Inbound handshake: read the peer's selected handshake first, then — only if `serves`
+    /// returns true for the requested infohash — reply with ours. Used by the seeder listener
+    /// to avoid replying (and thus leaking which infohashes we serve) to a peer asking for one
+    /// we don't have. Returns the peer's handshake on success.
+    pub async fn accept_handshake<F>(
+        &mut self,
+        our_peer_id: [u8; 20],
+        serves: F,
+    ) -> Result<Handshake>
+    where
+        F: FnOnce(&[u8; 20]) -> bool,
+    {
+        if self.protocol == HandshakeProtocol::BitTorrent {
+            let timeout = self.timeout;
+            let mut hs = [0u8; BITTORRENT_HANDSHAKE_LEN];
+            with_timeout(timeout, self.stream.read_exact(&mut hs)).await??;
+            let peer = Handshake::decode_with_protocol(&hs, HandshakeProtocol::BitTorrent)?;
+            if !serves(&peer.infohash) {
+                return Err(PeerError::InfohashMismatch);
+            }
+            let ours = Handshake::new(peer.infohash, our_peer_id)
+                .encode_with_protocol(HandshakeProtocol::BitTorrent);
+            with_timeout(timeout, self.stream.write_all(&ours)).await??;
+            return Ok(peer);
+        }
+        let timeout = self.timeout;
+        let mut prefix = [0u8; HANDSHAKE_PREFIX_LEN];
+        with_timeout(timeout, self.stream.read_exact(&mut prefix)).await??;
+        let mut peer = Handshake::decode_prefix(&prefix)?;
+        if !serves(&peer.infohash) {
+            return Err(PeerError::InfohashMismatch);
+        }
+        let mut peer_id_seen = false;
+        if let Some(peer_id) = self.read_optional_inbound_peer_id().await? {
+            peer.peer_id = peer_id;
+            peer_id_seen = true;
+        }
+        let ours = Handshake::new(peer.infohash, our_peer_id);
+        with_timeout(timeout, self.stream.write_all(&ours.encode())).await??;
+        if !peer_id_seen {
+            if let Some(peer_id) = self.read_optional_deferred_peer_id().await? {
+                peer.peer_id = peer_id;
+            }
+        }
+        Ok(peer)
+    }
+
+    async fn read_optional_inbound_peer_id(&mut self) -> Result<Option<[u8; 20]>> {
+        let mut peer_id = [0u8; 20];
+        let n = match tokio::time::timeout(INBOUND_PEER_ID_GRACE, self.stream.read(&mut peer_id))
+            .await
+        {
+            Ok(r) => r?,
+            Err(_) => return Ok(None),
+        };
+        if n == 0 {
+            return Ok(None);
+        }
+        if n < peer_id.len() {
+            with_timeout(self.timeout, self.stream.read_exact(&mut peer_id[n..])).await??;
+        }
+        Ok(Some(peer_id))
+    }
+
+    async fn read_optional_deferred_peer_id(&mut self) -> Result<Option<[u8; 20]>> {
+        let mut peer_id = [0u8; 20];
+        let n = match tokio::time::timeout(INBOUND_PEER_ID_GRACE, self.stream.read(&mut peer_id))
+            .await
+        {
+            Ok(r) => r?,
+            Err(_) => return Ok(None),
+        };
+        if n == 0 {
+            return Ok(None);
+        }
+        if !looks_like_acestream_peer_id_prefix(&peer_id[..n]) {
+            self.buf.extend_from_slice(&peer_id[..n]);
+            return Ok(None);
+        }
+        if n < peer_id.len() {
+            with_timeout(self.timeout, self.stream.read_exact(&mut peer_id[n..])).await??;
+        }
+        Ok(Some(peer_id))
+    }
+
+    /// Send a peer message.
+    pub async fn send(&mut self, msg: &PeerMessage) -> Result<()> {
+        with_timeout(self.timeout, self.stream.write_all(&msg.encode())).await??;
+        Ok(())
+    }
+
+    /// Send our BEP-10 extended handshake (id 20, sub-id 0), unsigned (no node identity).
+    /// Real peers require a signed identity — see [`send_signed_extended_handshake`].
+    ///
+    /// [`send_signed_extended_handshake`]: Self::send_signed_extended_handshake
+    pub async fn send_extended_handshake(
+        &mut self,
+        hs: &ace_wire::extended::OutgoingExtendedHandshake,
+    ) -> Result<()> {
+        let msg = PeerMessage::Extended {
+            ext_id: 0,
+            payload: hs.encode_payload(),
+        };
+        self.send(&msg).await
+    }
+
+    /// Send our extended handshake carrying our node identity + a valid signature
+    /// (note 17), which is what peers require before they will unchoke us.
+    pub async fn send_signed_extended_handshake(
+        &mut self,
+        hs: &ace_wire::extended::OutgoingExtendedHandshake,
+        identity: &ace_wire::identity::Identity,
+    ) -> Result<()> {
+        let msg = PeerMessage::Extended {
+            ext_id: 0,
+            payload: hs.sign_and_encode(identity),
+        };
+        self.send(&msg).await
+    }
+
+    /// Fetch the BEP-9 `ut_metadata` blob (for Acestream, the `AceStreamTransport` file):
+    /// request every 16 KiB piece from the peer and assemble the data blocks into a single
+    /// buffer of `metadata_size` bytes.
+    ///
+    /// `peer_ut_metadata_id` is the ext id the peer assigned to `ut_metadata` in its extended
+    /// handshake `m` dict; the BEP-10 handshake must already have been exchanged. Unrelated
+    /// messages are ignored; a `Reject` or an early close is an error.
+    pub async fn fetch_metadata(
+        &mut self,
+        peer_ut_metadata_id: u8,
+        metadata_size: usize,
+    ) -> Result<Vec<u8>> {
+        use ace_wire::ut_metadata::{
+            piece_count, request_piece, MetadataMessage, METADATA_BLOCK_LEN,
+        };
+        let pieces = piece_count(metadata_size);
+        if pieces == 0 {
+            return Ok(Vec::new());
+        }
+        for i in 0..pieces {
+            let payload = request_piece(i as i64);
+            self.send(&PeerMessage::Extended {
+                ext_id: peer_ut_metadata_id,
+                payload,
+            })
+            .await?;
+        }
+        let mut blob = vec![0u8; metadata_size];
+        let mut have = vec![false; pieces];
+        let mut remaining = pieces;
+        while remaining > 0 {
+            match self.read_message().await? {
+                PeerMessage::Extended { ext_id, payload } if ext_id != 0 => {
+                    match MetadataMessage::parse(&payload) {
+                        Some(MetadataMessage::Data { piece, data, .. }) => {
+                            let idx = piece as usize;
+                            if piece < 0 || idx >= pieces {
+                                continue;
+                            }
+                            let off = idx * METADATA_BLOCK_LEN;
+                            let end = (off + data.len()).min(metadata_size);
+                            if off < end {
+                                blob[off..end].copy_from_slice(&data[..end - off]);
+                            }
+                            if !have[idx] {
+                                have[idx] = true;
+                                remaining -= 1;
+                            }
+                        }
+                        Some(MetadataMessage::Reject { .. }) => {
+                            return Err(PeerError::Protocol("metadata request rejected"));
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {} // ignore non-metadata traffic during the fetch
+            }
+        }
+        Ok(blob)
+    }
+
+    /// Read exactly one peer message, buffering until a full frame is available.
+    pub async fn read_message(&mut self) -> Result<PeerMessage> {
+        loop {
+            if let Some((msg, consumed)) = PeerMessage::decode(&self.buf)? {
+                self.buf.drain(..consumed);
+                return Ok(msg);
+            }
+            let mut chunk = [0u8; 16 * 1024];
+            let n = with_timeout(self.timeout, self.stream.read(&mut chunk)).await??;
+            if n == 0 {
+                return Err(PeerError::Closed);
+            }
+            self.buf.extend_from_slice(&chunk[..n]);
+        }
+    }
+}
+
+fn looks_like_acestream_peer_id_prefix(bytes: &[u8]) -> bool {
+    const PREFIX: &[u8] = b"R30------";
+    bytes.len() <= PREFIX.len() && PREFIX.starts_with(bytes)
+        || bytes.len() > PREFIX.len() && bytes.starts_with(PREFIX)
+}
+
+/// Apply `dur` as a ceiling to `fut`, mapping elapsed time to `PeerError::Timeout`.
+async fn with_timeout<F, T>(dur: Duration, fut: F) -> Result<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::time::timeout(dur, fut)
+        .await
+        .map_err(|_| PeerError::Timeout)
+}
+
+use tokio::net::TcpStream;
+
+/// Connect a TCP peer session to `addr` (e.g. "1.2.3.4:8621").
+///
+/// The TCP connect is bounded by [`DEFAULT_PEER_TIMEOUT`] so an unreachable peer
+/// can't stall a connecting task indefinitely.
+pub async fn connect(addr: &str) -> Result<PeerSession<TcpStream>> {
+    let stream = with_timeout(DEFAULT_PEER_TIMEOUT, TcpStream::connect(addr)).await??;
+    Ok(PeerSession::new(stream))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ace_wire::handshake::Handshake;
+    use ace_wire::message::PeerMessage;
+
+    fn fixed_bittorrent_handshake(infohash: [u8; 20], peer_id: [u8; 20]) -> Vec<u8> {
+        let mut bytes = b"\x13BitTorrent protocol".to_vec();
+        bytes.extend([0u8; 8]);
+        bytes.extend(infohash);
+        bytes.extend(peer_id);
+        bytes
+    }
+
+    #[tokio::test]
+    async fn handshake_then_read_extended_over_duplex() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let infohash = [0x11u8; 20];
+
+        // The "server" side acts like a real peer: read our handshake, reply with its
+        // own (same infohash), then send an extended-handshake message.
+        let srv = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut hs = [0u8; 66];
+            server.read_exact(&mut hs).await.unwrap();
+            let peer_hs = Handshake::new(infohash, *b"R30------SERVERPEERx");
+            server.write_all(&peer_hs.encode()).await.unwrap();
+            let ext = PeerMessage::Extended {
+                ext_id: 0,
+                payload: b"d1:md11:ut_metadatai2eee".to_vec(),
+            };
+            server.write_all(&ext.encode()).await.unwrap();
+        });
+
+        let mut session = PeerSession::new(client);
+        let got = session
+            .perform_handshake(infohash, *b"R30------CLIENTPEERy")
+            .await
+            .unwrap();
+        assert_eq!(got.infohash, infohash);
+
+        let msg = session.read_message().await.unwrap();
+        match msg {
+            PeerMessage::Extended { ext_id, payload } => {
+                assert_eq!(ext_id, 0);
+                assert_eq!(payload, b"d1:md11:ut_metadatai2eee");
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+        srv.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore] // live network: connect to a real Acestream peer and exchange handshakes
+    async fn live_interop_handshake() {
+        // Provide a current peer + infohash via env, since live peers churn:
+        //   ACE_PEER=82.213.234.240:8623 ACE_INFOHASH=47eda3..afa022 cargo test -p ace-peer live_interop -- --ignored --nocapture
+        let peer = std::env::var("ACE_PEER").expect("set ACE_PEER=ip:port");
+        let ih_hex = std::env::var("ACE_INFOHASH").expect("set ACE_INFOHASH=40hex");
+        let mut ih = [0u8; 20];
+        ih.copy_from_slice(&hex::decode(ih_hex).unwrap());
+        let mut session = connect(&peer).await.unwrap();
+        let hs = session
+            .perform_handshake(ih, ace_wire::handshake::random_peer_id())
+            .await
+            .unwrap();
+        assert_eq!(hs.infohash, ih);
+        // Read the next message the peer sends (typically the extended handshake).
+        let msg = session.read_message().await.unwrap();
+        println!("live peer accepted handshake; first message: {msg:?}");
+    }
+
+    #[tokio::test]
+    async fn send_extended_handshake_frames_a_decodable_bep10_message() {
+        use ace_wire::extended::{ExtendedHandshake, OutgoingExtendedHandshake};
+
+        let (client, mut server) = tokio::io::duplex(4096);
+        let srv = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            // Read one full peer frame the way a real peer would.
+            let mut hdr = [0u8; 4];
+            server.read_exact(&mut hdr).await.unwrap();
+            let len = u32::from_be_bytes(hdr) as usize;
+            let mut body = vec![0u8; len];
+            server.read_exact(&mut body).await.unwrap();
+            let mut frame = hdr.to_vec();
+            frame.extend_from_slice(&body);
+            PeerMessage::decode(&frame).unwrap().unwrap().0
+        });
+
+        let mut session = PeerSession::new(client);
+        let hs = OutgoingExtendedHandshake {
+            ace_metadata_version: 1,
+            ut_metadata_id: 2,
+            mi: None,
+            node: Default::default(),
+            peer_ip: None,
+            metadata_size: None,
+        };
+        session.send_extended_handshake(&hs).await.unwrap();
+
+        match srv.await.unwrap() {
+            PeerMessage::Extended { ext_id, payload } => {
+                assert_eq!(ext_id, 0); // BEP-10 handshake sub-id
+                let parsed = ExtendedHandshake::parse(&payload).unwrap();
+                assert_eq!(parsed.ace_metadata_version, Some(1));
+                assert_eq!(parsed.ut_metadata_id(), Some(2));
+            }
+            other => panic!("expected Extended, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn read_message_times_out_on_silent_peer() {
+        // Keep `_server` alive so the read pends (open but idle) rather than EOF-ing.
+        let (client, _server) = tokio::io::duplex(4096);
+        let mut session = PeerSession::new(client).with_timeout(std::time::Duration::from_secs(5));
+        let res = session.read_message().await;
+        assert!(matches!(res, Err(PeerError::Timeout)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn perform_handshake_times_out_when_peer_never_replies() {
+        let (client, _server) = tokio::io::duplex(4096);
+        let mut session = PeerSession::new(client).with_timeout(std::time::Duration::from_secs(5));
+        let res = session
+            .perform_handshake([0x11u8; 20], *b"R30------CLIENTPEERy")
+            .await;
+        assert!(matches!(res, Err(PeerError::Timeout)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handshake_observer_distinguishes_blocked_write_from_silent_reply() {
+        for (capacity, expected_sent) in [(1, false), (4096, true)] {
+            let (client, _server) = tokio::io::duplex(capacity);
+            let mut session = PeerSession::new(client).with_timeout(Duration::from_secs(5));
+            let mut sent = false;
+            let result = session
+                .perform_handshake_with_observer([0; 20], [0; 20], || sent = true)
+                .await;
+            assert!(matches!(result, Err(PeerError::Timeout)));
+            assert_eq!(sent, expected_sent);
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_handshake_observer_accepts_a_genuinely_fnonce_callback() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut local = [0; HANDSHAKE_LEN];
+            server.read_exact(&mut local).await.unwrap();
+            server
+                .write_all(&Handshake::new([0; 20], [0; 20]).encode())
+                .await
+                .unwrap();
+        });
+        let mut session = PeerSession::new(client);
+        let token = String::from("consumed by FnOnce");
+        let sent = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sent_callback = sent.clone();
+
+        session
+            .perform_handshake_with_observer([0; 20], [1; 20], move || {
+                drop(token);
+                sent_callback.store(true, std::sync::atomic::Ordering::Relaxed);
+            })
+            .await
+            .unwrap();
+
+        assert!(sent.load(std::sync::atomic::Ordering::Relaxed));
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bittorrent_progress_observer_reports_sent_without_ace_reply_bytes() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let infohash = [0x11; 20];
+        let peer_id = [0x22; 20];
+        let server_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut local = [0; BITTORRENT_HANDSHAKE_LEN];
+            server.read_exact(&mut local).await.unwrap();
+            assert_eq!(
+                local.as_slice(),
+                fixed_bittorrent_handshake(infohash, peer_id)
+            );
+            server
+                .write_all(&fixed_bittorrent_handshake(infohash, [0x33; 20]))
+                .await
+                .unwrap();
+        });
+        let mut session = PeerSession::new(client).with_protocol(HandshakeProtocol::BitTorrent);
+        let mut events = Vec::new();
+
+        let result = session
+            .perform_handshake_with_progress_observer(infohash, peer_id, |event| events.push(event))
+            .await
+            .unwrap();
+
+        assert_eq!(result.infohash, infohash);
+        assert_eq!(events, [HandshakeProgress::Sent]);
+        server_task.await.unwrap();
+    }
+
+    struct ErrorAfterPrefix {
+        prefix: std::collections::VecDeque<u8>,
+        error: std::io::ErrorKind,
+        emitted_error: bool,
+    }
+
+    impl AsyncRead for ErrorAfterPrefix {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if !self.prefix.is_empty() {
+                let count = buf.remaining().min(self.prefix.len());
+                let bytes: Vec<_> = self.prefix.drain(..count).collect();
+                buf.put_slice(&bytes);
+                return Poll::Ready(Ok(()));
+            }
+            if !self.emitted_error {
+                self.emitted_error = true;
+                return Poll::Ready(Err(std::io::Error::new(
+                    self.error,
+                    "synthetic reply error",
+                )));
+            }
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for ErrorAfterPrefix {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn progress_observer_preserves_reset_and_other_io_errors_after_counting_prefix() {
+        for error_kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::BrokenPipe,
+        ] {
+            let stream = ErrorAfterPrefix {
+                prefix: [0xD4; 7].into(),
+                error: error_kind,
+                emitted_error: false,
+            };
+            let mut session = PeerSession::new(stream);
+            let mut events = Vec::new();
+
+            let result = session
+                .perform_handshake_with_progress_observer([0; 20], [1; 20], |event| {
+                    events.push(event)
+                })
+                .await;
+
+            assert!(matches!(
+                result,
+                Err(PeerError::Io(ref error)) if error.kind() == error_kind
+            ));
+            assert_eq!(
+                events,
+                [
+                    HandshakeProgress::Sent,
+                    HandshakeProgress::ReplyBytes { received: 7 }
+                ]
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn progress_observer_reports_sent_and_zero_reply_when_outer_deadline_cancels() {
+        let (client, _server) = tokio::io::duplex(4096);
+        let mut session = PeerSession::new(client).with_timeout(Duration::from_secs(5));
+        let mut events = Vec::new();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            session.perform_handshake_with_progress_observer([0; 20], [0; 20], |event| {
+                events.push(event)
+            }),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "outer deadline should cancel the pending reply read"
+        );
+        assert_eq!(events, [HandshakeProgress::Sent]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn progress_observer_retains_partial_prefix_consumed_before_outer_cancellation() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut local = [0; HANDSHAKE_LEN];
+            server.read_exact(&mut local).await.unwrap();
+            server.write_all(&[0xA5; 7]).await.unwrap();
+            // Keep the read pending after the prefix has been consumed.
+            std::future::pending::<()>().await;
+        });
+        let mut session = PeerSession::new(client).with_timeout(Duration::from_secs(5));
+        let mut events = Vec::new();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            session.perform_handshake_with_progress_observer([0; 20], [0; 20], |event| {
+                events.push(event)
+            }),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "outer deadline should cancel the partial reply read"
+        );
+        assert_eq!(
+            events,
+            [
+                HandshakeProgress::Sent,
+                HandshakeProgress::ReplyBytes { received: 7 }
+            ]
+        );
+        server_task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn progress_observer_retains_partial_prefix_when_inner_reply_deadline_expires() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut local = [0; HANDSHAKE_LEN];
+            server.read_exact(&mut local).await.unwrap();
+            server.write_all(&[0xC3; 7]).await.unwrap();
+            // Keep the read pending after the prefix has been consumed.
+            std::future::pending::<()>().await;
+        });
+        let mut session = PeerSession::new(client).with_timeout(Duration::from_secs(1));
+        let mut events = Vec::new();
+
+        let result = session
+            .perform_handshake_with_progress_observer([0; 20], [0; 20], |event| events.push(event))
+            .await;
+
+        assert!(matches!(result, Err(PeerError::Timeout)));
+        assert_eq!(
+            events,
+            [
+                HandshakeProgress::Sent,
+                HandshakeProgress::ReplyBytes { received: 7 }
+            ]
+        );
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn progress_observer_reports_partial_eof_and_preserves_read_error() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut local = [0; HANDSHAKE_LEN];
+            server.read_exact(&mut local).await.unwrap();
+            server.write_all(&[0x5A; 11]).await.unwrap();
+            server.shutdown().await.unwrap();
+        });
+        let mut session = PeerSession::new(client);
+        let mut events = Vec::new();
+
+        let result = session
+            .perform_handshake_with_progress_observer([0; 20], [0; 20], |event| events.push(event))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(PeerError::Io(ref error)) if error.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
+        assert_eq!(
+            events,
+            [
+                HandshakeProgress::Sent,
+                HandshakeProgress::ReplyBytes { received: 11 }
+            ]
+        );
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn progress_observer_counts_full_malformed_reply_without_accepting_it() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut local = [0; HANDSHAKE_LEN];
+            server.read_exact(&mut local).await.unwrap();
+            server.write_all(&[0; HANDSHAKE_LEN]).await.unwrap();
+        });
+        let mut session = PeerSession::new(client);
+        let mut events = Vec::new();
+
+        let result = session
+            .perform_handshake_with_progress_observer([0; 20], [0; 20], |event| events.push(event))
+            .await;
+
+        assert!(matches!(result, Err(PeerError::Wire(_))));
+        assert_eq!(
+            events,
+            [
+                HandshakeProgress::Sent,
+                HandshakeProgress::ReplyBytes {
+                    received: HANDSHAKE_LEN
+                }
+            ]
+        );
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn progress_observer_counts_hash_mismatch_only_after_full_reply_validation() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut local = [0; HANDSHAKE_LEN];
+            server.read_exact(&mut local).await.unwrap();
+            server
+                .write_all(&Handshake::new([1; 20], [2; 20]).encode())
+                .await
+                .unwrap();
+        });
+        let mut session = PeerSession::new(client);
+        let mut events = Vec::new();
+
+        let result = session
+            .perform_handshake_with_progress_observer([0; 20], [0; 20], |event| events.push(event))
+            .await;
+
+        assert!(matches!(result, Err(PeerError::InfohashMismatch)));
+        assert_eq!(
+            events,
+            [
+                HandshakeProgress::Sent,
+                HandshakeProgress::ReplyBytes {
+                    received: HANDSHAKE_LEN
+                }
+            ]
+        );
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn progress_observer_stops_at_basic_reply_and_leaves_following_frame_readable() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let infohash = [0x11; 20];
+        let frame = PeerMessage::KeepAlive.encode();
+        let server_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut local = [0; HANDSHAKE_LEN];
+            server.read_exact(&mut local).await.unwrap();
+            server
+                .write_all(&Handshake::new(infohash, [2; 20]).encode())
+                .await
+                .unwrap();
+            server.write_all(&frame).await.unwrap();
+        });
+        let mut session = PeerSession::new(client);
+        let mut events = Vec::new();
+
+        let result = session
+            .perform_handshake_with_progress_observer(infohash, [3; 20], |event| events.push(event))
+            .await
+            .unwrap();
+        let following = session.read_message().await.unwrap();
+
+        assert_eq!(result.infohash, infohash);
+        assert_eq!(following, PeerMessage::KeepAlive);
+        assert_eq!(
+            events,
+            [
+                HandshakeProgress::Sent,
+                HandshakeProgress::ReplyBytes {
+                    received: HANDSHAKE_LEN
+                }
+            ]
+        );
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore] // live network: drive past the handshake and observe unchoke/piece behavior
+    async fn live_recon_unchoke() {
+        // Phase 3.2 recon. Capture hot peers from the engine namespace, then e.g.:
+        //   ACE_PEER=82.213.234.240:8623 ACE_INFOHASH=47eda3..afa022 \
+        //     cargo test -p ace-peer live_recon -- --ignored --nocapture
+        use ace_wire::extended::{ExtendedHandshake, LivePosition, OutgoingExtendedHandshake};
+        use ace_wire::live_codec::chunk_request;
+
+        let peer = std::env::var("ACE_PEER").expect("set ACE_PEER=ip:port");
+        let ih_hex = std::env::var("ACE_INFOHASH").expect("set ACE_INFOHASH=40hex");
+        let mut ih = [0u8; 20];
+        ih.copy_from_slice(&hex::decode(ih_hex).unwrap());
+
+        let mut session = connect(&peer)
+            .await
+            .unwrap()
+            .with_timeout(Duration::from_secs(10));
+        session
+            .perform_handshake(ih, ace_wire::handshake::random_peer_id())
+            .await
+            .unwrap();
+        println!("[recon {peer}] handshake accepted");
+
+        // The peer's first message is its extended handshake — read its live window.
+        let first = session.read_message().await.unwrap();
+        let mut their_pos: Option<LivePosition> = None;
+        if let PeerMessage::Extended {
+            ext_id: 0,
+            ref payload,
+        } = first
+        {
+            if let Ok(eh) = ExtendedHandshake::parse(payload) {
+                let top = |k: &[u8]| eh.raw.get(k).and_then(|v| v.as_int());
+                println!(
+                    "[recon {peer}] their identity: ts={:?} v={:?} pv={:?} p={:?} nt={:?} platform={:?}",
+                    top(b"ts"), top(b"v"), top(b"pv"), top(b"p"), top(b"nt"), top(b"platform"),
+                );
+                let mi = eh.raw.get(b"mi");
+                let get = |k: &[u8]| mi.and_then(|m| m.get(k)).and_then(|v| v.as_int());
+                println!(
+                    "[recon {peer}] mi: min={:?} max={:?} pos={:?} dist={:?}",
+                    get(b"min_piece"),
+                    get(b"max_piece"),
+                    get(b"position"),
+                    get(b"distance_from_source"),
+                );
+                if let (Some(min), Some(max), Some(pos)) =
+                    (get(b"min_piece"), get(b"max_piece"), get(b"position"))
+                {
+                    their_pos = Some(LivePosition {
+                        min_piece: min,
+                        max_piece: max,
+                        position: pos,
+                        distance_from_source: get(b"distance_from_source").unwrap_or(99),
+                    });
+                }
+            }
+        } else {
+            println!("[recon {peer}] first message was not an extended handshake: {first:?}");
+        }
+
+        // Experiment knobs (env): ACE_NO_MI=1 sends no mi; ACE_DIST=N overrides the
+        // advertised distance_from_source; ACE_NO_INTERESTED=1 holds without interest.
+        let env = |k: &str| std::env::var(k).ok();
+        let mi = if env("ACE_NO_MI").is_some() {
+            None
+        } else {
+            their_pos.map(|mut p| {
+                if let Some(d) = env("ACE_DIST").and_then(|v| v.parse().ok()) {
+                    p.distance_from_source = d;
+                }
+                p
+            })
+        };
+        let has_mi = mi.is_some();
+        // Mint our own Ed25519 identity (node_id = our pubkey).
+        let identity = ace_wire::identity::Identity::generate();
+        let ts: i64 = env("ACE_TS").and_then(|v| v.parse().ok()).unwrap_or(1);
+
+        // The peer's IP (for `yourip`), parsed from the ip:port we connected to.
+        let peer_ip: Option<[u8; 4]> = {
+            let host = peer.rsplit_once(':').map(|(h, _)| h).unwrap_or(&peer);
+            let octets: Vec<u8> = host
+                .split('.')
+                .filter_map(|o| o.parse::<u8>().ok())
+                .collect();
+            <[u8; 4]>::try_from(octets.as_slice()).ok()
+        };
+
+        // Build + send the full signed handshake via the promoted library API.
+        let hs = OutgoingExtendedHandshake {
+            ace_metadata_version: 1,
+            ut_metadata_id: 2,
+            mi,
+            node: ace_wire::extended::NodeFields {
+                ts,
+                ..Default::default()
+            },
+            peer_ip,
+            metadata_size: None,
+        };
+        session
+            .send_signed_extended_handshake(&hs, &identity)
+            .await
+            .unwrap();
+        println!(
+            "[recon {peer}] sent FULL SIGNED handshake (mi={}, node_id={})",
+            if has_mi { "yes" } else { "no" },
+            hex::encode(identity.node_id())
+        );
+        if env("ACE_NO_INTERESTED").is_none() {
+            session.send(&PeerMessage::Interested).await.unwrap();
+            println!("[recon {peer}] sent interested");
+        }
+
+        // Observe what the peer does: unchoke? bitfield? have? piece?
+        let mut unchoked = false;
+        loop {
+            match session.read_message().await {
+                Ok(msg) => {
+                    match &msg {
+                        PeerMessage::Unchoke => {
+                            unchoked = true;
+                            println!("[recon {peer}] >>> UNCHOKE");
+                        }
+                        PeerMessage::Bitfield(b) => {
+                            println!("[recon {peer}] bitfield ({} bytes)", b.len())
+                        }
+                        PeerMessage::Have(i) => println!("[recon {peer}] have {i}"),
+                        PeerMessage::Piece {
+                            index,
+                            begin,
+                            block,
+                        } => {
+                            println!("[recon {peer}] >>> PIECE idx={index} begin={begin} ({} bytes) head={}",
+                                block.len(), hex::encode(&block[..block.len().min(24)]));
+                            if let Ok(path) = std::env::var("ACE_DUMP") {
+                                use std::io::Write;
+                                // Structured record so we can reassemble by (piece, chunk)
+                                // offline: [piece u32 BE][chunk u16 BE][len u32 BE][data].
+                                // piece = `begin`; chunk = block[8..10]; data = block[10..].
+                                if block.len() > 10 {
+                                    let chunk = ((block[8] as u16) << 8) | block[9] as u16;
+                                    let data = &block[10..];
+                                    let mut rec = Vec::new();
+                                    rec.extend_from_slice(&begin.to_be_bytes());
+                                    rec.extend_from_slice(&chunk.to_be_bytes());
+                                    rec.extend_from_slice(&(data.len() as u32).to_be_bytes());
+                                    rec.extend_from_slice(data);
+                                    let mut fh = std::fs::OpenOptions::new()
+                                        .create(true)
+                                        .append(true)
+                                        .open(&path)
+                                        .unwrap();
+                                    fh.write_all(&rec).unwrap();
+                                }
+                            }
+                        }
+                        PeerMessage::Unknown { id, payload } => println!(
+                            "[recon {peer}] >>> msg id={id} ({} bytes) head={}",
+                            payload.len(),
+                            hex::encode(&payload[..payload.len().min(16)])
+                        ),
+                        other => println!("[recon {peer}] {other:?}"),
+                    }
+                    if unchoked {
+                        if let Some(p) = their_pos {
+                            // Acestream request (id=6, 10-byte payload): [stream u32=0]
+                            // [piece u32][chunk u16]. Pull ACE_CHUNKS chunks each across
+                            // ACE_PIECES consecutive complete pieces ending below the head.
+                            let chunks: u16 =
+                                env("ACE_CHUNKS").and_then(|v| v.parse().ok()).unwrap_or(4);
+                            let pieces: u32 =
+                                env("ACE_PIECES").and_then(|v| v.parse().ok()).unwrap_or(1);
+                            let base = (p.max_piece as u32).saturating_sub(pieces);
+                            for piece in base..base + pieces {
+                                for chunk in 0..chunks {
+                                    session.send(&chunk_request(piece, chunk)).await.unwrap();
+                                }
+                            }
+                            println!(
+                                "[recon {peer}] requested pieces {base}..{} x {chunks} chunks",
+                                base + pieces
+                            );
+                            unchoked = false; // request once; keep reading for the data
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("[recon {peer}] read ended: {e:?}");
+                    break;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_metadata_assembles_multi_piece_blob() {
+        use ace_wire::ut_metadata::{data_piece, MetadataMessage, METADATA_BLOCK_LEN};
+        // A 2-piece blob: one full 16 KiB block + a 100-byte remainder.
+        let metadata: Vec<u8> = (0..(METADATA_BLOCK_LEN + 100))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let total = metadata.len();
+        let meta_peer = metadata.clone();
+        let peer_ut_id = 2u8;
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        // Mock peer: answer every ut_metadata request with the matching data block.
+        let srv = tokio::spawn(async move {
+            let mut sess = PeerSession::new(server);
+            let pieces = total.div_ceil(METADATA_BLOCK_LEN);
+            let mut served = 0;
+            while served < pieces {
+                match sess.read_message().await {
+                    Ok(PeerMessage::Extended { ext_id, payload }) if ext_id == peer_ut_id => {
+                        if let Some(MetadataMessage::Request { piece }) =
+                            MetadataMessage::parse(&payload)
+                        {
+                            let off = piece as usize * METADATA_BLOCK_LEN;
+                            let end = (off + METADATA_BLOCK_LEN).min(total);
+                            let resp = data_piece(piece, total as i64, &meta_peer[off..end]);
+                            sess.send(&PeerMessage::Extended {
+                                ext_id: peer_ut_id,
+                                payload: resp,
+                            })
+                            .await
+                            .unwrap();
+                            served += 1;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        let mut session = PeerSession::new(client);
+        let got = session.fetch_metadata(peer_ut_id, total).await.unwrap();
+        assert_eq!(got, metadata);
+        srv.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_metadata_errors_on_reject() {
+        let peer_ut_id = 2u8;
+        let (client, server) = tokio::io::duplex(8 * 1024);
+        let srv = tokio::spawn(async move {
+            let mut sess = PeerSession::new(server);
+            if let Ok(PeerMessage::Extended { .. }) = sess.read_message().await {
+                // Reject piece 0: {msg_type: 2, piece: 0}.
+                let reject = b"d8:msg_typei2e5:piecei0ee".to_vec();
+                let _ = sess
+                    .send(&PeerMessage::Extended {
+                        ext_id: peer_ut_id,
+                        payload: reject,
+                    })
+                    .await;
+            }
+        });
+        let mut session = PeerSession::new(client);
+        let res = session.fetch_metadata(peer_ut_id, 100).await;
+        assert!(matches!(res, Err(PeerError::Protocol(_))));
+        srv.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handshake_rejects_wrong_infohash() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let srv = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut hs = [0u8; 66];
+            server.read_exact(&mut hs).await.unwrap();
+            // reply with a DIFFERENT infohash
+            let peer_hs = Handshake::new([0x22u8; 20], *b"R30------SERVERPEERx");
+            server.write_all(&peer_hs.encode()).await.unwrap();
+        });
+        let mut session = PeerSession::new(client);
+        let res = session
+            .perform_handshake([0x11u8; 20], *b"R30------CLIENTPEERy")
+            .await;
+        assert!(matches!(res, Err(PeerError::InfohashMismatch)));
+        srv.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn accept_handshake_replies_when_we_serve_the_infohash() {
+        let (client, server) = tokio::io::duplex(256);
+        let ih = [0x42u8; 20];
+        let client_id = *b"R30------CLIENTPEERy";
+        let server_id = *b"R30------SERVERPEERy";
+
+        let client_task = tokio::spawn(async move {
+            let mut p = PeerSession::new(client);
+            p.perform_handshake(ih, client_id).await
+        });
+
+        let mut server_session = PeerSession::new(server);
+        let got = server_session
+            .accept_handshake(server_id, |peer_ih| *peer_ih == ih)
+            .await
+            .unwrap();
+        assert_eq!(got.infohash, ih);
+        assert_eq!(got.peer_id, client_id);
+
+        let client_got = client_task.await.unwrap().unwrap();
+        assert_eq!(client_got.infohash, ih);
+        assert_eq!(client_got.peer_id, server_id);
+    }
+
+    #[tokio::test]
+    async fn accept_handshake_replies_to_official_short_inbound_handshake() {
+        let (mut client, server) = tokio::io::duplex(256);
+        let ih = [0x43u8; 20];
+        let client_id = *b"R30------CLIENTPEERy";
+        let server_id = *b"R30------SERVERPEERy";
+
+        let short = Handshake::new(ih, client_id).encode()[..46].to_vec();
+        let client_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            client.write_all(&short).await.unwrap();
+            let mut reply = [0u8; HANDSHAKE_LEN];
+            client.read_exact(&mut reply).await.unwrap();
+            Handshake::decode(&reply)
+        });
+
+        let mut server_session = PeerSession::new(server).with_timeout(Duration::from_millis(100));
+        let got = server_session
+            .accept_handshake(server_id, |peer_ih| *peer_ih == ih)
+            .await
+            .unwrap();
+        assert_eq!(got.infohash, ih);
+        assert_eq!(
+            got.peer_id, [0u8; 20],
+            "the official short inbound handshake omits peer_id; keep that explicit"
+        );
+
+        let client_got = client_task.await.unwrap().unwrap();
+        assert_eq!(client_got.infohash, ih);
+        assert_eq!(client_got.peer_id, server_id);
+    }
+
+    #[tokio::test]
+    async fn accept_handshake_drains_deferred_peer_id_after_official_short_handshake() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let ih = [0x44u8; 20];
+        let client_id = *b"R30------CLIENTPEERy";
+        let server_id = *b"R30------SERVERPEERy";
+        let ext = PeerMessage::Extended {
+            ext_id: 0,
+            payload: b"d1:md11:ut_metadatai2eee".to_vec(),
+        };
+        let ext_wire = ext.encode();
+
+        let short = Handshake::new(ih, client_id).encode()[..46].to_vec();
+        let client_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            client.write_all(&short).await.unwrap();
+            let mut reply = [0u8; HANDSHAKE_LEN];
+            client.read_exact(&mut reply).await.unwrap();
+            client.write_all(&client_id).await.unwrap();
+            client.write_all(&ext_wire).await.unwrap();
+            Handshake::decode(&reply)
+        });
+
+        let mut server_session = PeerSession::new(server).with_timeout(Duration::from_millis(200));
+        let got = server_session
+            .accept_handshake(server_id, |peer_ih| *peer_ih == ih)
+            .await
+            .unwrap();
+        assert_eq!(got.infohash, ih);
+        assert_eq!(got.peer_id, client_id);
+        assert_eq!(server_session.read_message().await.unwrap(), ext);
+
+        let client_got = client_task.await.unwrap().unwrap();
+        assert_eq!(client_got.infohash, ih);
+        assert_eq!(client_got.peer_id, server_id);
+    }
+
+    #[tokio::test]
+    async fn accept_handshake_refuses_an_infohash_we_dont_serve() {
+        let (client, server) = tokio::io::duplex(256);
+        let ih = [0x42u8; 20];
+
+        let client_task = tokio::spawn(async move {
+            let mut p = PeerSession::new(client).with_timeout(Duration::from_millis(200));
+            // The client performs its handshake write+read; if the server never replies,
+            // perform_handshake's own read will time out.
+            p.perform_handshake(ih, *b"R30------CLIENTPEERy").await
+        });
+
+        let mut server_session = PeerSession::new(server);
+        let result = server_session
+            .accept_handshake(*b"R30------SERVERPEERy", |_| false)
+            .await;
+        assert!(result.is_err(), "must refuse an infohash we don't serve");
+
+        // The client never got a reply, so its own handshake read times out / errors.
+        assert!(client_task.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn bittorrent_outgoing_handshake_is_literal_and_keeps_following_frame() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client, mut server) = tokio::io::duplex(4096);
+        let infohash = [0x42; 20];
+        let peer_id = *b"-UT0001-123456789012";
+        let expected_client = fixed_bittorrent_handshake(infohash, peer_id);
+        let server_task = tokio::spawn(async move {
+            let mut received = [0u8; 68];
+            server.read_exact(&mut received).await.unwrap();
+            assert_eq!(received.as_slice(), expected_client);
+
+            let mut response = b"\x13BitTorrent protocol".to_vec();
+            response.extend([0u8; 8]);
+            response.extend(infohash);
+            response.extend(*b"-UT0001-abcdefghijkl");
+            response.extend(PeerMessage::Bitfield(vec![0x80]).encode());
+            server.write_all(&response).await.unwrap();
+        });
+
+        let mut session = PeerSession::new(client).with_protocol(HandshakeProtocol::BitTorrent);
+        let peer = session.perform_handshake(infohash, peer_id).await.unwrap();
+        assert_eq!(peer.infohash, infohash);
+        assert_eq!(peer.peer_id, *b"-UT0001-abcdefghijkl");
+        assert_eq!(
+            session.read_message().await.unwrap(),
+            PeerMessage::Bitfield(vec![0x80])
+        );
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bittorrent_outgoing_handshake_rejects_wrong_infohash() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client, mut server) = tokio::io::duplex(256);
+        let infohash = [0x42; 20];
+        let peer_id = *b"-UT0001-123456789012";
+        let server_task = tokio::spawn(async move {
+            let mut received = [0u8; 68];
+            server.read_exact(&mut received).await.unwrap();
+            server
+                .write_all(&fixed_bittorrent_handshake(
+                    [0x24; 20],
+                    *b"-UT0001-abcdefghijkl",
+                ))
+                .await
+                .unwrap();
+        });
+
+        let mut session = PeerSession::new(client).with_protocol(HandshakeProtocol::BitTorrent);
+        assert!(session.perform_handshake(infohash, peer_id).await.is_err());
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bittorrent_outgoing_handshake_rejects_acestream_protocol_reply() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client, mut server) = tokio::io::duplex(256);
+        let infohash = [0x42; 20];
+        let peer_id = *b"-UT0001-123456789012";
+        let server_task = tokio::spawn(async move {
+            let mut received = [0u8; 68];
+            server.read_exact(&mut received).await.unwrap();
+            // Fixed ACE protocol bytes followed by two bytes so the BT session receives a full
+            // 68-byte handshake candidate and must reject its protocol identity.
+            let mut reply = b"\x11AceStreamProtocol".to_vec();
+            reply.extend([0u8; 8]);
+            reply.extend(infohash);
+            reply.extend(*b"R30------SERVERPEERx");
+            reply.extend([0u8; 2]);
+            server.write_all(&reply).await.unwrap();
+        });
+
+        let mut session = PeerSession::new(client).with_protocol(HandshakeProtocol::BitTorrent);
+        assert!(session.perform_handshake(infohash, peer_id).await.is_err());
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bittorrent_outgoing_handshake_rejects_truncated_reply() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client, mut server) = tokio::io::duplex(256);
+        let infohash = [0x42; 20];
+        let peer_id = *b"-UT0001-123456789012";
+        let server_task = tokio::spawn(async move {
+            let mut received = [0u8; 68];
+            server.read_exact(&mut received).await.unwrap();
+            server
+                .write_all(&fixed_bittorrent_handshake(infohash, *b"-UT0001-abcdefghijkl")[..67])
+                .await
+                .unwrap();
+        });
+
+        let mut session = PeerSession::new(client)
+            .with_protocol(HandshakeProtocol::BitTorrent)
+            .with_timeout(Duration::from_millis(200));
+        assert!(session.perform_handshake(infohash, peer_id).await.is_err());
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bittorrent_accept_handshake_requires_full_literal_handshake() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut client, server) = tokio::io::duplex(256);
+        let infohash = [0x42; 20];
+        let client_id = *b"-UT0001-123456789012";
+        let client_task = tokio::spawn(async move {
+            client
+                .write_all(&fixed_bittorrent_handshake(infohash, client_id))
+                .await
+                .unwrap();
+            let mut response = [0u8; 68];
+            client.read_exact(&mut response).await.unwrap();
+            response.to_vec()
+        });
+
+        let server_id = *b"-UT0001-abcdefghijkl";
+        let mut session = PeerSession::new(server).with_protocol(HandshakeProtocol::BitTorrent);
+        let peer = session
+            .accept_handshake(server_id, |candidate| *candidate == infohash)
+            .await
+            .unwrap();
+        assert_eq!(peer.peer_id, client_id);
+        assert_eq!(
+            client_task.await.unwrap(),
+            fixed_bittorrent_handshake(infohash, server_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn bittorrent_accept_handshake_rejects_truncated_peer_without_ace_grace() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, server) = tokio::io::duplex(256);
+        let infohash = [0x42; 20];
+        let short = fixed_bittorrent_handshake(infohash, [0x11; 20]);
+        let client_task = tokio::spawn(async move {
+            client.write_all(&short[..47]).await.unwrap();
+            client.shutdown().await.unwrap();
+        });
+
+        let mut session = PeerSession::new(server)
+            .with_protocol(HandshakeProtocol::BitTorrent)
+            .with_timeout(Duration::from_millis(200));
+        assert!(session
+            .accept_handshake(*b"-UT0001-abcdefghijkl", |_| true)
+            .await
+            .is_err());
+        client_task.await.unwrap();
+    }
+}

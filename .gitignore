@@ -1,0 +1,17 @@
+node_modules/
+test-results/
+*.wgt
+*.zip
+**/target/
+**/.git/
+*.PRIVATE.*
+.env
+.env.*
+*.p12
+*.pfx
+*.pem
+password.txt
+profiles.xml
+work/signing-stage-*/
+work/toolchain/samsung-emscripten/
+work/toolchain/wasm-bindgen-*/

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<widget xmlns="http://www.w3.org/ns/widgets" xmlns:tizen="http://tizen.org/ns/widgets" id="https://bella.local/acetv-wire-probe" version="0.1.1" viewmodes="maximized">
+  <tizen:application id="DaniAceW01.WireProbe" package="DaniAceW01" required_version="5.5" />
+  <name>Ace TV Wire Probe</name>
+  <content src="app/index.html" />
+  <access origin="*" subdomains="true" />
+  <tizen:profile name="tv-samsung" />
+  <tizen:privilege name="http://tizen.org/privilege/internet" />
+  <tizen:setting screen-orientation="landscape" context-menu="disable" background-support="disable" encryption="disable" hwkey-event="enable" />
+</widget>

@@ -1,0 +1,1423 @@
+//! A bounded, rolling store of downloaded (or broadcast) piece data, keyed by piece then chunk.
+//! Feeds the seeder: we serve chunks we still hold. Eviction is FIFO by lowest piece index once
+//! the byte budget is exceeded.
+//!
+//! The store's internals sit behind a [`Backend`]: the default `Memory` backend keeps piece data
+//! in RAM (pure, no I/O), while the optional `Disk` backend spills chunk payloads to one file per
+//! piece so operators can retain far more reseed data without paying RAM. Both share the same
+//! `max_bytes` budget and public API; only the disk backend touches the filesystem, and only in
+//! [`chunk`](PieceStore::chunk) / the `put_chunk*` writers.
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
+
+// Declaration order ensures payload storage is released before disk admission.
+pub(crate) struct ReciprocalChunk {
+    pub(crate) data: Vec<u8>,
+    pub(crate) header: [u8; 8],
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+/// Maximum request block accepted from a standard BitTorrent peer (BEP 3 convention).
+pub const MAX_BT_REQUEST_LEN: u32 = 16 * 1024;
+
+/// Result of an atomic trusted whole-wire publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletePut {
+    Published,
+    AlreadyPresent,
+    NotRetained,
+}
+
+mod disk;
+use disk::DiskBackend;
+
+#[derive(Debug)]
+pub struct PieceStore {
+    piece_length: u64,
+    chunk_length: u64,
+    max_bytes: u64,
+    cur_bytes: u64,
+    backend: Backend,
+    /// Optional age bound: pieces first seen longer ago than this are evicted even while under
+    /// the byte budget. For a live stream this makes retained reseed data track *time* (window ×
+    /// bitrate) instead of a fixed byte cap, so RAM scales with the stream rather than always
+    /// filling `max_bytes`. `max_bytes` remains a hard safety ceiling. `None` preserves the
+    /// original byte-only behavior (used by VOD/broadcast stores).
+    retention: Option<Duration>,
+    /// First-seen instant per retained piece index, kept in lockstep with the backend's piece set:
+    /// every retained piece has an entry, and eviction removes it. Only populated when `retention`
+    /// is set, to avoid the bookkeeping cost on byte-only stores.
+    first_seen: BTreeMap<u64, Instant>,
+    /// Newest insertion instant observed. Age eviction measures each piece against this, not against
+    /// wall-clock now, so the store keeps the last `retention` of *stream* content: a playback stall
+    /// (no new inserts) does not drain the reseed cache, and out-of-order arrival can't make the
+    /// window collapse. Only tracked when `retention` is set.
+    newest_seen: Option<Instant>,
+}
+
+/// How a [`PieceStore`] keeps its piece data. Selected once at construction.
+pub enum BackendKind {
+    /// Keep piece data in RAM (default; pure, no I/O).
+    Memory,
+    /// Spill chunk payloads to one file per piece under `dir`. The directory is treated as
+    /// ephemeral: any stale contents from a prior run are wiped when the store is created.
+    Disk { dir: std::path::PathBuf },
+}
+
+/// The storage implementation backing a [`PieceStore`]. Byte accounting and eviction policy live
+/// on `PieceStore`; a backend only owns the piece maps and reports how many bytes an insert
+/// replaced or an eviction freed so the accounting stays backend-agnostic.
+#[derive(Debug)]
+enum Backend {
+    Memory(MemoryBackend),
+    Disk(DiskBackend),
+}
+
+/// Byte-accounting deltas from a single insert, so `PieceStore` can keep `cur_bytes` exact
+/// without knowing which backend actually stored the data. On the disk backend a failed write
+/// reports `added: 0` so a dropped chunk never inflates the running total.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct Stored {
+    /// Bytes newly written and now counted toward the budget.
+    added: u64,
+    /// Bytes freed by replacing an existing chunk at the same `(piece, chunk)` slot.
+    removed: u64,
+}
+
+impl Backend {
+    /// Insert `(piece, chunk)`, applying the header-upgrade rule. Returns the byte deltas the
+    /// caller should apply to its running total.
+    fn put(&mut self, piece: u64, chunk: u16, header: [u8; 8], data: &[u8]) -> Stored {
+        match self {
+            Backend::Memory(m) => m.put(piece, chunk, header, data),
+            Backend::Disk(d) => d.put(piece, chunk, header, data),
+        }
+    }
+
+    fn get(&self, piece: u64, chunk: u16) -> Option<Cow<'_, [u8]>> {
+        match self {
+            Backend::Memory(m) => m.get(piece, chunk),
+            Backend::Disk(d) => d.get(piece, chunk),
+        }
+    }
+
+    fn header(&self, piece: u64) -> Option<[u8; 8]> {
+        match self {
+            Backend::Memory(m) => m.header(piece),
+            Backend::Disk(d) => d.header(piece),
+        }
+    }
+
+    fn has_piece(&self, piece: u64, chunks_per_piece: u16) -> bool {
+        match self {
+            Backend::Memory(m) => m.has_piece(piece, chunks_per_piece),
+            Backend::Disk(d) => d.has_piece(piece, chunks_per_piece),
+        }
+    }
+
+    fn have_pieces(&self, chunks_per_piece: u16) -> Vec<u64> {
+        match self {
+            Backend::Memory(m) => m.have_pieces(chunks_per_piece),
+            Backend::Disk(d) => d.have_pieces(chunks_per_piece),
+        }
+    }
+
+    fn window(&self) -> Option<(u64, u64)> {
+        match self {
+            Backend::Memory(m) => m.window(),
+            Backend::Disk(d) => d.window(),
+        }
+    }
+
+    /// Evict the lowest-index piece; return the byte total it freed, or `None` if the store was
+    /// already empty. `Some(0)` (a zero-byte piece) is distinct from `None` so the eviction loop
+    /// keeps going until the store is actually empty rather than halting on a zero-byte piece.
+    fn evict_lowest(&mut self) -> Option<u64> {
+        match self {
+            Backend::Memory(m) => m.evict_lowest(),
+            Backend::Disk(d) => d.evict_lowest(),
+        }
+    }
+}
+
+/// In-RAM backend: today's `BTreeMap` piece store, moved verbatim behind the backend boundary.
+#[derive(Debug, Default)]
+struct MemoryBackend {
+    /// piece index -> (chunk index -> TS payload bytes)
+    pieces: BTreeMap<u64, BTreeMap<u16, Vec<u8>>>,
+    /// piece index -> Acestream's 8-byte live piece header.
+    headers: BTreeMap<u64, [u8; 8]>,
+}
+
+impl MemoryBackend {
+    fn put(&mut self, piece: u64, chunk: u16, header: [u8; 8], data: &[u8]) -> Stored {
+        self.headers
+            .entry(piece)
+            .and_modify(|stored| {
+                if *stored == [0u8; 8] && header != [0u8; 8] {
+                    *stored = header;
+                }
+            })
+            .or_insert(header);
+        let entry = self.pieces.entry(piece).or_default();
+        let removed = entry
+            .insert(chunk, data.to_vec())
+            .map_or(0, |old| old.len() as u64);
+        Stored {
+            added: data.len() as u64,
+            removed,
+        }
+    }
+
+    fn get(&self, piece: u64, chunk: u16) -> Option<Cow<'_, [u8]>> {
+        self.pieces
+            .get(&piece)?
+            .get(&chunk)
+            .map(|v| Cow::Borrowed(v.as_slice()))
+    }
+
+    fn header(&self, piece: u64) -> Option<[u8; 8]> {
+        self.headers.get(&piece).copied()
+    }
+
+    fn has_piece(&self, piece: u64, chunks_per_piece: u16) -> bool {
+        self.pieces
+            .get(&piece)
+            .is_some_and(|c| c.len() as u16 == chunks_per_piece)
+    }
+
+    fn have_pieces(&self, chunks_per_piece: u16) -> Vec<u64> {
+        self.pieces
+            .keys()
+            .copied()
+            .filter(|&p| self.has_piece(p, chunks_per_piece))
+            .collect()
+    }
+
+    fn window(&self) -> Option<(u64, u64)> {
+        let min = *self.pieces.keys().next()?;
+        let max = *self.pieces.keys().next_back()?;
+        Some((min, max))
+    }
+
+    fn evict_lowest(&mut self) -> Option<u64> {
+        let (&lowest, _) = self.pieces.iter().next()?;
+        let removed = self.pieces.remove(&lowest);
+        self.headers.remove(&lowest);
+        Some(
+            removed
+                .map(|c| c.values().map(|d| d.len() as u64).sum())
+                .unwrap_or(0),
+        )
+    }
+}
+
+impl PieceStore {
+    /// Admission owns metadata and handles only; wire remains with the caller.
+    pub(crate) async fn begin_complete_admission(
+        store: Arc<Mutex<Self>>,
+        piece: u64,
+        wire_len: usize,
+    ) -> std::io::Result<CompleteAdmission> {
+        let guard = store.lock_owned().await;
+        let length = guard.piece_length;
+        let chunk = guard.chunk_length;
+        if length == 0
+            || chunk == 0
+            || length % chunk != 0
+            || length / chunk > u16::MAX as u64
+            || usize::try_from(length).ok() != Some(wire_len)
+            || u32::try_from(chunk).is_err()
+        {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
+        if guard.max_bytes < length {
+            return Ok(CompleteAdmission::Immediate {
+                result: CompletePut::NotRetained,
+                wire_len,
+            });
+        }
+        let Backend::Disk(disk) = &guard.backend else {
+            return Ok(CompleteAdmission::Memory {
+                guard,
+                piece,
+                wire_len,
+            });
+        };
+        let handle = disk.handle();
+        let max = guard.max_bytes;
+        let chunks = (length / chunk) as u16;
+        let retention = guard.retention;
+        drop(guard);
+        let permit = handle.reserve_complete().await?;
+        Ok(CompleteAdmission::Disk {
+            handle,
+            permit,
+            piece,
+            wire_len,
+            max,
+            chunks,
+            retention,
+        })
+    }
+
+    fn put_complete_memory(
+        &mut self,
+        piece: u64,
+        header: [u8; 8],
+        wire: &[u8],
+    ) -> std::io::Result<CompletePut> {
+        let guard = self;
+        let length = guard.piece_length;
+        let chunk = guard.chunk_length;
+        let chunks = (length / chunk) as u16;
+        let Backend::Memory(memory) = &mut guard.backend else {
+            unreachable!()
+        };
+        if memory.has_piece(piece, chunks) {
+            return Ok(CompletePut::AlreadyPresent);
+        }
+        let complete = wire
+            .chunks_exact(chunk as usize)
+            .enumerate()
+            .map(|(i, bytes)| (i as u16, bytes.to_vec()))
+            .collect();
+        let removed = memory
+            .pieces
+            .insert(piece, complete)
+            .map_or(0, |old| old.values().map(|b| b.len() as u64).sum());
+        memory.headers.insert(piece, header);
+        guard.cur_bytes = guard.cur_bytes - removed + length;
+        let now = Instant::now();
+        if guard.retention.is_some() {
+            guard.first_seen.entry(piece).or_insert(now);
+            guard.newest_seen = Some(guard.newest_seen.map_or(now, |old| old.max(now)));
+        }
+        while guard.cur_bytes > guard.max_bytes {
+            let Some(freed) = guard.evict_lowest_tracked() else {
+                break;
+            };
+            guard.cur_bytes -= freed;
+        }
+        if let (Some(age), Some(newest)) = (guard.retention, guard.newest_seen) {
+            while guard
+                .first_seen
+                .first_key_value()
+                .is_some_and(|(_, seen)| newest.saturating_duration_since(*seen) >= age)
+            {
+                let Some(freed) = guard.evict_lowest_tracked() else {
+                    break;
+                };
+                guard.cur_bytes -= freed;
+            }
+        }
+        Ok(if guard.has_piece(piece) {
+            CompletePut::Published
+        } else {
+            CompletePut::NotRetained
+        })
+    }
+
+    pub(crate) fn refresh_complete_accounting(&mut self) {
+        if let Backend::Disk(disk) = &self.backend {
+            self.cur_bytes = disk.retained_bytes();
+        }
+    }
+
+    /// Publish trusted full wire bytes atomically. Authentication belongs to the caller.
+    pub async fn shared_put_complete_piece(
+        store: &Arc<Mutex<Self>>,
+        piece: u64,
+        header: [u8; 8],
+        wire: &[u8],
+    ) -> std::io::Result<CompletePut> {
+        let admission =
+            Self::begin_complete_admission(Arc::clone(store), piece, wire.len()).await?;
+        let result = match admission.submit(header, wire)? {
+            CompleteReceipt::Ready(result) => return Ok(result),
+            CompleteReceipt::Awaiting(done) => done
+                .await
+                .unwrap_or_else(|_| Err(std::io::ErrorKind::BrokenPipe.into())),
+        };
+        store.lock().await.refresh_complete_accounting();
+        result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_publication(
+        &self,
+        reached: Arc<tokio::sync::Notify>,
+        gate: std::sync::mpsc::Receiver<()>,
+    ) {
+        match &self.backend {
+            Backend::Disk(disk) => disk.pause_publication(reached, gate),
+            _ => panic!("disk fixture required"),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reciprocal_admission_witness(&self, notify: Arc<tokio::sync::Notify>) {
+        if let Backend::Disk(disk) = &self.backend {
+            disk.admission_witness(notify);
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn reciprocal_available(&self) -> usize {
+        match &self.backend {
+            Backend::Disk(disk) => disk.reciprocal_available(),
+            _ => 1,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_read(
+        &self,
+        reached: Arc<tokio::sync::Notify>,
+        gate: std::sync::mpsc::Receiver<()>,
+    ) {
+        match &self.backend {
+            Backend::Disk(disk) => disk.pause_read(reached, gate),
+            _ => panic!("disk fixture required"),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publication_budget(&self) -> (usize, usize) {
+        match &self.backend {
+            Backend::Disk(disk) => disk.publication_budget(),
+            _ => panic!("disk fixture required"),
+        }
+    }
+
+    /// Read a chunk from a shared store without running disk I/O on a Tokio worker thread.
+    /// Memory stores take the ordinary async lock and preserve their zero-copy internal path;
+    /// disk stores perform the synchronous compatibility operation on the blocking pool.
+    pub async fn shared_chunk(
+        store: &Arc<Mutex<Self>>,
+        piece: u64,
+        chunk: u16,
+    ) -> Option<(Vec<u8>, [u8; 8])> {
+        let handle = {
+            let guard = store.lock().await;
+            match &guard.backend {
+                Backend::Memory(_) => {
+                    return guard.chunk(piece, chunk).map(|data| {
+                        (
+                            data.into_owned(),
+                            guard.piece_header(piece).unwrap_or([0; 8]),
+                        )
+                    });
+                }
+                Backend::Disk(disk) => disk.handle(),
+            }
+        };
+        handle.get(piece, chunk).await
+    }
+
+    pub(crate) async fn shared_reciprocal_chunk(
+        store: &Arc<Mutex<Self>>,
+        piece: u64,
+        chunk: u16,
+    ) -> Option<ReciprocalChunk> {
+        let handle = {
+            #[cfg(not(test))]
+            let guard = store.lock().await;
+            #[cfg(test)]
+            let guard = {
+                use std::future::Future;
+                let mut lock = std::pin::pin!(store.lock());
+                std::future::poll_fn(|cx| {
+                    let result = lock.as_mut().poll(cx);
+                    if result.is_pending() {
+                        reciprocal_lock_witness::pending(store);
+                    }
+                    result
+                })
+                .await
+            };
+            match &guard.backend {
+                Backend::Memory(_) => {
+                    return Some(ReciprocalChunk {
+                        data: guard.chunk(piece, chunk)?.into_owned(),
+                        header: guard.piece_header(piece).unwrap_or([0; 8]),
+                        _permit: None,
+                    })
+                }
+                Backend::Disk(disk) => disk.handle(),
+            }
+        };
+        handle.reciprocal_get(piece, chunk).await
+    }
+
+    /// Read a standard BitTorrent byte block from a piece stored as request-sized chunks.
+    /// Returns `None` unless every byte in the requested range is retained.
+    pub async fn shared_block(
+        store: &Arc<Mutex<Self>>,
+        piece: u64,
+        begin: u32,
+        length: u32,
+    ) -> Option<Vec<u8>> {
+        if length == 0 || length > MAX_BT_REQUEST_LEN {
+            return None;
+        }
+        let (chunk_length, piece_length) = {
+            let guard = store.lock().await;
+            (guard.chunk_length, guard.piece_length)
+        };
+        let end = u64::from(begin).checked_add(u64::from(length))?;
+        // Bound hostile request geometry before looping or allocating. BEP 3 blocks are normally
+        // 16 KiB; permit larger compatible requests up to one piece, but never beyond it.
+        if end > piece_length {
+            return None;
+        }
+        let first = u64::from(begin) / chunk_length;
+        let last = end.div_ceil(chunk_length);
+        let mut piece_bytes = Vec::new();
+        for chunk in first..last {
+            let (data, _) = Self::shared_chunk(store, piece, u16::try_from(chunk).ok()?).await?;
+            piece_bytes.extend_from_slice(&data);
+        }
+        let offset = (u64::from(begin) % chunk_length) as usize;
+        let requested_end = offset.checked_add(length as usize)?;
+        Some(piece_bytes.get(offset..requested_end)?.to_vec())
+    }
+
+    /// Write a chunk to a shared store without running disk I/O on a Tokio worker thread.
+    pub async fn shared_put_chunk_with_header(
+        store: &Arc<Mutex<Self>>,
+        piece: u64,
+        chunk: u16,
+        header: [u8; 8],
+        data: &[u8],
+    ) {
+        let (handle, max_bytes) = {
+            let mut guard = store.lock().await;
+            if guard.max_bytes == 0 || (chunk as u64) >= guard.piece_length / guard.chunk_length {
+                return;
+            }
+            match &guard.backend {
+                Backend::Memory(_) => {
+                    guard.put_chunk_with_header(piece, chunk, header, data);
+                    return;
+                }
+                Backend::Disk(disk) => (disk.handle(), guard.max_bytes),
+            }
+        };
+        handle
+            .put(piece, chunk, header, data.to_vec(), max_bytes)
+            .await;
+    }
+
+    /// # Panics
+    /// `chunk_length` must be > 0 (otherwise [`chunks_per_piece`](Self::chunks_per_piece) divides
+    /// by zero), and `piece_length` should be a multiple of `chunk_length`. Domain inputs are
+    /// always 1 MiB / 16 KiB, so this is documented rather than asserted at runtime.
+    pub fn new(piece_length: u64, chunk_length: u64, max_bytes: u64) -> Self {
+        // Memory backend never fails to build, so this stays infallible for back-compat.
+        Self::with_backend(piece_length, chunk_length, max_bytes, BackendKind::Memory)
+            .expect("memory backend is infallible")
+    }
+
+    /// Build a store with an explicitly chosen [`BackendKind`]. Fails only when a `Disk` backend
+    /// cannot prepare its cache directory.
+    pub fn with_backend(
+        piece_length: u64,
+        chunk_length: u64,
+        max_bytes: u64,
+        kind: BackendKind,
+    ) -> std::io::Result<Self> {
+        let backend = match kind {
+            BackendKind::Memory => Backend::Memory(MemoryBackend::default()),
+            BackendKind::Disk { dir } => Backend::Disk(DiskBackend::new(dir, chunk_length)?),
+        };
+        Ok(PieceStore {
+            piece_length,
+            chunk_length,
+            max_bytes,
+            cur_bytes: 0,
+            backend,
+            retention: None,
+            first_seen: BTreeMap::new(),
+            newest_seen: None,
+        })
+    }
+
+    /// Bound retained pieces by age as well as bytes: on each write, pieces first seen more than
+    /// `retention` ago are evicted (oldest first), so a live seed store holds ~`retention` × bitrate
+    /// of recent data instead of always growing to `max_bytes`. `max_bytes` still caps the store as
+    /// a hard ceiling. A zero `retention` is treated as "no age bound".
+    pub fn with_retention(mut self, retention: Duration) -> Self {
+        self.retention = (!retention.is_zero()).then_some(retention);
+        self
+    }
+
+    /// Convenience: a disk-backed store rooted at `dir` (its contents are wiped on creation).
+    pub fn new_disk(
+        piece_length: u64,
+        chunk_length: u64,
+        max_bytes: u64,
+        dir: std::path::PathBuf,
+    ) -> std::io::Result<Self> {
+        Self::with_backend(
+            piece_length,
+            chunk_length,
+            max_bytes,
+            BackendKind::Disk { dir },
+        )
+    }
+
+    /// Chunks per piece (`piece_length / chunk_length`).
+    pub fn chunks_per_piece(&self) -> u16 {
+        (self.piece_length / self.chunk_length) as u16
+    }
+
+    /// Store a chunk's wire data, including any source-signature trailer. Replacing an existing chunk adjusts the byte total. After the
+    /// insert, evict the lowest-index pieces until within `max_bytes`. If `max_bytes` is smaller
+    /// than `data.len()`, the chunk is evicted immediately after insertion (a no-op write).
+    pub fn put_chunk(&mut self, piece: u64, chunk: u16, data: &[u8]) {
+        self.put_chunk_with_header(piece, chunk, [0u8; 8], data);
+    }
+
+    /// Store a chunk plus the piece-scoped 8-byte live header observed on the wire. The header is
+    /// stable for every chunk in a piece; a later nonzero header replaces an earlier zero
+    /// placeholder; relay and source paths preserve the observed headers.
+    pub fn put_chunk_with_header(&mut self, piece: u64, chunk: u16, header: [u8; 8], data: &[u8]) {
+        self.put_chunk_with_header_at(Instant::now(), piece, chunk, header, data);
+    }
+
+    /// [`put_chunk_with_header`](Self::put_chunk_with_header) with an explicit "now", so age-based
+    /// eviction is deterministic under test. Production callers use the wall-clock wrapper.
+    fn put_chunk_with_header_at(
+        &mut self,
+        now: Instant,
+        piece: u64,
+        chunk: u16,
+        header: [u8; 8],
+        data: &[u8],
+    ) {
+        // A zero budget is the explicit no-retention policy used when disk-mode construction
+        // fails. Do not even touch backend metadata: empty payloads add zero accounted bytes and
+        // would otherwise accumulate piece/chunk/header entries without triggering eviction.
+        if self.max_bytes == 0 {
+            return;
+        }
+        // Chunk indices arrive straight off the wire (id=7). Drop any index outside the piece's
+        // geometry so a stray value can't sit in the chunk map — inflating its length so
+        // `has_piece` never counts the piece complete (it would then never be reseeded) and
+        // wasting byte budget that should hold real reseed data (issue #91). A valid chunk index
+        // is always < chunks_per_piece, even for a short final piece (which has fewer chunks).
+        // Compared as u64 to avoid the u16 truncation in `chunks_per_piece`.
+        if (chunk as u64) >= self.piece_length / self.chunk_length {
+            return;
+        }
+        let stored = self.backend.put(piece, chunk, header, data);
+        if self.retention.is_some() {
+            self.first_seen.entry(piece).or_insert(now);
+            self.newest_seen = Some(self.newest_seen.map_or(now, |m| m.max(now)));
+        }
+        if let Backend::Disk(disk) = &self.backend {
+            // Admitted whole publications can outlive their async callers. Refresh
+            // after the serialized write rather than applying deltas to a stale mirror.
+            self.cur_bytes = disk.retained_bytes();
+        } else {
+            self.cur_bytes -= stored.removed;
+            self.cur_bytes += stored.added;
+        }
+        while self.cur_bytes > self.max_bytes {
+            // Stop only when the store is empty (`None`); a zero-byte piece (`Some(0)`) must not
+            // halt eviction while real over-budget bytes remain in higher pieces.
+            let Some(freed) = self.evict_lowest_tracked() else {
+                break;
+            };
+            self.cur_bytes -= freed;
+        }
+        // Age eviction: the store evicts lowest-index-first (its FIFO contract), so we drop from the
+        // oldest end while the oldest retained piece is more than `retention` behind the newest
+        // piece we have seen. Measuring against `newest_seen` rather than wall-clock keeps the window
+        // pinned to recent *stream* content: a stall never drains the cache, and an out-of-order
+        // late arrival can't shrink the window (its own timestamp is recent, so it is kept).
+        if let (Some(retention), Some(newest)) = (self.retention, self.newest_seen) {
+            while let Some((_, &seen)) = self.first_seen.iter().next() {
+                if newest.saturating_duration_since(seen) < retention {
+                    break;
+                }
+                let Some(freed) = self.evict_lowest_tracked() else {
+                    break;
+                };
+                self.cur_bytes -= freed;
+            }
+        }
+    }
+
+    /// Evict the lowest-index (oldest) piece from the backend and drop its `first_seen` entry so the
+    /// age index stays in lockstep with the stored piece set. Returns the bytes freed.
+    fn evict_lowest_tracked(&mut self) -> Option<u64> {
+        let freed = self.backend.evict_lowest()?;
+        self.first_seen.pop_first();
+        Some(freed)
+    }
+
+    /// The Acestream live piece header for `piece`, if known.
+    pub fn piece_header(&self, piece: u64) -> Option<[u8; 8]> {
+        self.backend.header(piece)
+    }
+
+    /// The TS payload of `(piece, chunk)` if still held. Borrowed from RAM on the memory backend;
+    /// read from disk (and owned) on the disk backend — hence [`Cow`].
+    pub fn chunk(&self, piece: u64, chunk: u16) -> Option<Cow<'_, [u8]>> {
+        self.backend.get(piece, chunk)
+    }
+
+    /// True iff every chunk of `piece` is present.
+    pub fn has_piece(&self, piece: u64) -> bool {
+        self.backend.has_piece(piece, self.chunks_per_piece())
+    }
+
+    /// Sorted indices of fully-held pieces (for `Have` advertisement).
+    pub fn have_pieces(&self) -> Vec<u64> {
+        self.backend.have_pieces(self.chunks_per_piece())
+    }
+
+    /// `(min, max)` stored piece indices, or None if empty.
+    pub fn window(&self) -> Option<(u64, u64)> {
+        self.backend.window()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 4-byte chunks, 2 chunks/piece, tiny budget for eviction tests.
+    fn store(max_bytes: u64) -> PieceStore {
+        PieceStore::new(8, 4, max_bytes)
+    }
+
+    #[tokio::test]
+    async fn contract_concurrent_complete_puts_preserve_one_whole_generation() {
+        for disk in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let backend = if disk {
+                BackendKind::Disk {
+                    dir: dir.path().join("cache"),
+                }
+            } else {
+                BackendKind::Memory
+            };
+            let store = Arc::new(Mutex::new(
+                PieceStore::with_backend(8, 4, 8, backend).unwrap(),
+            ));
+            let (a, b) = tokio::join!(
+                PieceStore::shared_put_complete_piece(&store, 7, [1; 8], b"abcdefgh"),
+                PieceStore::shared_put_complete_piece(&store, 7, [2; 8], b"ijklmnop")
+            );
+            let a = a.unwrap();
+            let b = b.unwrap();
+            assert!(matches!(
+                (a, b),
+                (CompletePut::Published, CompletePut::AlreadyPresent)
+                    | (CompletePut::AlreadyPresent, CompletePut::Published)
+            ));
+            let (wire, header) = if a == CompletePut::Published {
+                (b"abcdefgh", [1; 8])
+            } else {
+                (b"ijklmnop", [2; 8])
+            };
+            assert_eq!(
+                PieceStore::shared_block(&store, 7, 0, 8).await.unwrap(),
+                wire
+            );
+            assert_eq!(store.lock().await.piece_header(7), Some(header));
+            assert_eq!(store.lock().await.cur_bytes, 8);
+        }
+    }
+
+    #[tokio::test]
+    async fn contract_complete_publication_is_exact_immutable_and_budgeted_on_both_backends() {
+        for disk in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let backend = if disk {
+                BackendKind::Disk {
+                    dir: dir.path().join("cache"),
+                }
+            } else {
+                BackendKind::Memory
+            };
+            let store = Arc::new(Mutex::new(
+                PieceStore::with_backend(8, 4, 16, backend).unwrap(),
+            ));
+            assert!(PieceStore::shared_chunk(&store, 7, 0).await.is_none());
+            assert_eq!(
+                PieceStore::shared_put_complete_piece(&store, 7, [3; 8], b"abcdefgh")
+                    .await
+                    .unwrap(),
+                CompletePut::Published
+            );
+            assert_eq!(
+                PieceStore::shared_chunk(&store, 7, 0).await,
+                Some((b"abcd".to_vec(), [3; 8]))
+            );
+            assert_eq!(
+                PieceStore::shared_chunk(&store, 7, 1).await,
+                Some((b"efgh".to_vec(), [3; 8]))
+            );
+            assert_eq!(
+                PieceStore::shared_put_complete_piece(&store, 8, [4; 8], b"ijklmnop")
+                    .await
+                    .unwrap(),
+                CompletePut::Published
+            );
+            assert_eq!(
+                PieceStore::shared_put_complete_piece(&store, 7, [9; 8], b"XXXXXXXX")
+                    .await
+                    .unwrap(),
+                CompletePut::AlreadyPresent
+            );
+            assert_eq!(
+                PieceStore::shared_block(&store, 7, 0, 8).await.unwrap(),
+                b"abcdefgh"
+            );
+            assert_eq!(store.lock().await.cur_bytes, 16);
+            PieceStore::shared_put_complete_piece(&store, 9, [5; 8], b"qrstuvwx")
+                .await
+                .unwrap();
+            let guard = store.lock().await;
+            assert_eq!(guard.have_pieces(), vec![8, 9]);
+            assert_eq!(guard.cur_bytes, 16);
+            assert!(guard.piece_header(7).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn contract_complete_publication_rejects_geometry_without_mutation() {
+        for disk in [false, true] {
+            for (piece_len, chunk_len, wire) in [
+                (8, 4, b"short".as_slice()),
+                (8, 4, b"too long!".as_slice()),
+                (8, 3, b"abcdefgh".as_slice()),
+                (0, 4, b"".as_slice()),
+                (8, 0, b"abcdefgh".as_slice()),
+                (65536, 1, b"".as_slice()),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let backend = if disk {
+                    BackendKind::Disk {
+                        dir: dir.path().join("cache"),
+                    }
+                } else {
+                    BackendKind::Memory
+                };
+                let store = Arc::new(Mutex::new(
+                    PieceStore::with_backend(piece_len, chunk_len, 100000, backend).unwrap(),
+                ));
+                assert!(
+                    PieceStore::shared_put_complete_piece(&store, 7, [3; 8], wire)
+                        .await
+                        .is_err()
+                );
+                let guard = store.lock().await;
+                if chunk_len != 0 {
+                    assert!(guard.have_pieces().is_empty());
+                    assert_eq!(guard.window(), None);
+                }
+                assert_eq!(guard.cur_bytes, 0);
+                assert!(guard.piece_header(7).is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn contract_complete_publication_disabled_or_undersized_has_no_metadata() {
+        for disk in [false, true] {
+            for budget in [0, 7] {
+                let dir = tempfile::tempdir().unwrap();
+                let backend = if disk {
+                    BackendKind::Disk {
+                        dir: dir.path().join("cache"),
+                    }
+                } else {
+                    BackendKind::Memory
+                };
+                let store = Arc::new(Mutex::new(
+                    PieceStore::with_backend(8, 4, budget, backend).unwrap(),
+                ));
+                assert_eq!(
+                    PieceStore::shared_put_complete_piece(&store, 7, [1; 8], b"abcdefgh")
+                        .await
+                        .unwrap(),
+                    CompletePut::NotRetained
+                );
+                let guard = store.lock().await;
+                assert_eq!(guard.cur_bytes, 0);
+                assert_eq!(guard.window(), None);
+                assert!(guard.piece_header(7).is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn standard_block_validates_request_geometry_and_short_final_piece() {
+        let store = Arc::new(Mutex::new(PieceStore::new(32_768, 16_384, 65_536)));
+        PieceStore::shared_put_chunk_with_header(&store, 0, 0, [0; 8], &vec![1; 16_384]).await;
+        PieceStore::shared_put_chunk_with_header(&store, 0, 1, [0; 8], &vec![2; 16_384]).await;
+        PieceStore::shared_put_chunk_with_header(&store, 1, 0, [0; 8], &[3; 100]).await;
+
+        assert_eq!(
+            PieceStore::shared_block(&store, 0, 16_380, 8)
+                .await
+                .unwrap(),
+            [vec![1; 4], vec![2; 4]].concat()
+        );
+        assert!(PieceStore::shared_block(&store, 0, 0, 0).await.is_none());
+        assert!(
+            PieceStore::shared_block(&store, 0, 0, MAX_BT_REQUEST_LEN + 1)
+                .await
+                .is_none()
+        );
+        assert!(PieceStore::shared_block(&store, 0, u32::MAX, 1)
+            .await
+            .is_none());
+        assert!(
+            PieceStore::shared_block(&store, 1, 96, 8).await.is_none(),
+            "request crossing the retained short final piece is rejected"
+        );
+    }
+
+    #[test]
+    fn stores_and_returns_a_chunk() {
+        let mut s = store(1024);
+        s.put_chunk(10, 0, &[1, 2, 3, 4]);
+        assert_eq!(s.chunk(10, 0).as_deref(), Some(&[1, 2, 3, 4][..]));
+        assert_eq!(s.chunk(10, 1).as_deref(), None);
+        assert_eq!(s.chunk(11, 0).as_deref(), None);
+    }
+
+    #[test]
+    fn has_piece_true_only_when_all_chunks_present() {
+        let mut s = store(1024);
+        assert_eq!(s.chunks_per_piece(), 2);
+        s.put_chunk(5, 0, &[1, 2, 3, 4]);
+        assert!(!s.has_piece(5));
+        s.put_chunk(5, 1, &[5, 6, 7, 8]);
+        assert!(s.has_piece(5));
+        assert_eq!(s.have_pieces(), vec![5]);
+    }
+
+    // Fill piece `p` (both 4-byte chunks) at instant `t`.
+    fn put_full_at(s: &mut PieceStore, t: Instant, p: u64) {
+        s.put_chunk_with_header_at(t, p, 0, [0; 8], &[9; 4]);
+        s.put_chunk_with_header_at(t, p, 1, [0; 8], &[9; 4]);
+    }
+
+    #[test]
+    fn retention_evicts_pieces_older_than_window() {
+        let mut s = store(1 << 20).with_retention(Duration::from_secs(30));
+        let t0 = Instant::now();
+        for p in 0..3 {
+            put_full_at(&mut s, t0, p);
+        }
+        assert_eq!(s.window(), Some((0, 2)));
+        // A write 31s later pushes the t0 pieces outside the 30s window, evicting them.
+        put_full_at(&mut s, t0 + Duration::from_secs(31), 3);
+        assert_eq!(
+            s.window(),
+            Some((3, 3)),
+            "pieces older than the retention window are evicted even under the byte budget"
+        );
+    }
+
+    #[test]
+    fn retention_keeps_pieces_within_window() {
+        let mut s = store(1 << 20).with_retention(Duration::from_secs(30));
+        let t0 = Instant::now();
+        put_full_at(&mut s, t0, 0);
+        put_full_at(&mut s, t0 + Duration::from_secs(10), 1);
+        assert_eq!(
+            s.window(),
+            Some((0, 1)),
+            "both pieces are within the 30s window and are retained"
+        );
+    }
+
+    #[test]
+    fn retention_respects_byte_ceiling() {
+        // Generous window, but the byte ceiling only holds two full 8-byte pieces.
+        let mut s = store(16).with_retention(Duration::from_secs(3600));
+        let t0 = Instant::now();
+        for p in 0..4 {
+            put_full_at(&mut s, t0, p);
+        }
+        assert_eq!(
+            s.window(),
+            Some((2, 3)),
+            "byte ceiling still caps the store when everything is inside the window"
+        );
+    }
+
+    #[test]
+    fn retention_window_survives_out_of_order_arrival() {
+        // A late-arriving lower-index piece is recent, so it (and the slightly older higher-index
+        // piece already held) stay within the window — the window is measured against the newest
+        // piece seen, not the lowest index's wall-clock age.
+        let mut s = store(1 << 20).with_retention(Duration::from_secs(30));
+        let t0 = Instant::now();
+        put_full_at(&mut s, t0, 5);
+        put_full_at(&mut s, t0 + Duration::from_secs(5), 4);
+        assert_eq!(
+            s.window(),
+            Some((4, 5)),
+            "recent out-of-order pieces are both retained"
+        );
+    }
+
+    #[test]
+    fn without_retention_skips_age_bookkeeping() {
+        let mut s = store(1 << 20);
+        s.put_chunk(0, 0, &[1, 2, 3, 4]);
+        assert!(
+            s.first_seen.is_empty(),
+            "byte-only stores must not pay the per-piece age-tracking cost"
+        );
+    }
+
+    #[test]
+    fn ignores_a_chunk_index_outside_the_piece_geometry() {
+        // Chunk indices come straight off the wire (id=7). A stray out-of-range index must not
+        // enter the piece's chunk map: otherwise it inflates the map length so `has_piece`
+        // never counts the piece complete (it would never be reseeded) and it wastes byte
+        // budget that should hold real reseed data (issue #91).
+        let mut s = store(1024);
+        assert_eq!(s.chunks_per_piece(), 2); // valid chunk indices are 0 and 1
+        s.put_chunk(5, 0, &[1, 2, 3, 4]);
+        s.put_chunk(5, 99, &[9, 9, 9, 9]); // bogus index from a hostile/buggy peer
+        s.put_chunk(5, 1, &[5, 6, 7, 8]);
+        assert!(
+            s.has_piece(5),
+            "a stray chunk index must not block the piece from completing"
+        );
+        assert_eq!(s.have_pieces(), vec![5]);
+        assert_eq!(
+            s.chunk(5, 99),
+            None,
+            "the out-of-range chunk must never be stored"
+        );
+    }
+
+    #[test]
+    fn window_reflects_min_and_max() {
+        let mut s = store(1024);
+        assert_eq!(s.window(), None);
+        s.put_chunk(7, 0, &[0; 4]);
+        s.put_chunk(9, 0, &[0; 4]);
+        assert_eq!(s.window(), Some((7, 9)));
+    }
+
+    #[test]
+    fn evicts_lowest_piece_when_over_budget() {
+        // budget = 8 bytes = exactly two 4-byte chunks. A third chunk evicts the lowest piece.
+        let mut s = store(8);
+        s.put_chunk(1, 0, &[0; 4]);
+        s.put_chunk(2, 0, &[0; 4]);
+        assert_eq!(s.window(), Some((1, 2)));
+        s.put_chunk(3, 0, &[0; 4]); // over budget -> drop piece 1
+        assert_eq!(s.chunk(1, 0).as_deref(), None, "lowest piece evicted");
+        assert_eq!(s.window(), Some((2, 3)));
+    }
+
+    #[test]
+    fn replacing_a_chunk_does_not_double_count_bytes() {
+        let mut s = store(8);
+        s.put_chunk(1, 0, &[0; 4]);
+        s.put_chunk(1, 0, &[9; 4]); // replace, not add
+        s.put_chunk(1, 1, &[0; 4]);
+        // Still one piece (1) with two chunks = 8 bytes, nothing evicted.
+        assert_eq!(s.chunk(1, 0).as_deref(), Some(&[9, 9, 9, 9][..]));
+        assert!(s.has_piece(1));
+    }
+
+    #[test]
+    fn budget_smaller_than_one_chunk_discards_gracefully() {
+        let mut s = PieceStore::new(8, 4, 3); // max_bytes < chunk size
+        s.put_chunk(1, 0, &[0; 4]);
+        assert_eq!(s.chunk(1, 0).as_deref(), None); // evicted immediately, no panic
+        assert_eq!(s.window(), None);
+    }
+
+    #[test]
+    fn zero_budget_retains_no_payload_or_metadata_even_for_empty_chunks() {
+        let mut store = PieceStore::new(8, 4, 0);
+        for piece in 0..10_000 {
+            store.put_chunk_with_header(piece, 0, [0x55; 8], &[]);
+            store.put_chunk_with_header(piece, 1, [0xaa; 8], &[1, 2, 3, 4]);
+        }
+
+        assert!(store.chunk(0, 0).is_none());
+        assert!(store.chunk(9_999, 1).is_none());
+        assert!(store.piece_header(0).is_none());
+        assert!(store.piece_header(9_999).is_none());
+        assert!(store.have_pieces().is_empty());
+        assert_eq!(store.window(), None);
+    }
+
+    #[test]
+    fn eviction_runs_multiple_iterations_if_needed() {
+        let mut s = store(4); // 1-chunk budget
+        s.put_chunk(1, 0, &[0; 4]);
+        s.put_chunk(2, 0, &[0; 4]); // evicts piece 1
+        s.put_chunk(3, 0, &[0; 4]); // evicts piece 2
+        assert_eq!(s.chunk(1, 0).as_deref(), None);
+        assert_eq!(s.chunk(2, 0).as_deref(), None);
+        assert_eq!(s.window(), Some((3, 3)));
+    }
+
+    #[test]
+    fn eviction_does_not_halt_on_a_zero_byte_lowest_piece() {
+        // budget = 4 bytes. Piece 1 holds a zero-length chunk (0 bytes); pieces 2 and 3 each hold
+        // a real 4-byte chunk. Adding piece 3 pushes over budget; eviction must skip past the
+        // zero-byte piece 1 and keep evicting real bytes, not stop at the Some(0) piece.
+        let mut s = store(4);
+        s.put_chunk(1, 0, &[]); // 0 bytes, creates piece 1
+        s.put_chunk(2, 0, &[0; 4]); // cur = 4 (at budget)
+        s.put_chunk(3, 0, &[0; 4]); // cur = 8 > 4 -> must evict down to <= 4
+        assert!(!s.has_piece(1), "zero-byte piece evicted, not skipped");
+        assert_eq!(s.chunk(1, 0).as_deref(), None);
+        assert_eq!(
+            s.chunk(2, 0).as_deref(),
+            None,
+            "real bytes above it also evicted"
+        );
+        assert_eq!(s.window(), Some((3, 3)));
+    }
+
+    #[test]
+    fn have_pieces_excludes_partial_pieces() {
+        let mut s = store(1024); // 2 chunks/piece
+        s.put_chunk(5, 0, &[0; 4]); // piece 5 partial
+        s.put_chunk(6, 0, &[0; 4]);
+        s.put_chunk(6, 1, &[0; 4]); // piece 6 complete
+        assert_eq!(s.have_pieces(), vec![6]);
+    }
+
+    #[test]
+    fn has_piece_flips_true_on_the_chunk_that_completes_it() {
+        // Mirrors the Have-advertisement use case in ace-engine's follow_one_peer: check
+        // has_piece() right after each put_chunk to know exactly when to fire a Have.
+        let mut s = store(1024); // 2 chunks/piece (per the existing `store()` test helper)
+        assert!(!s.has_piece(9));
+        s.put_chunk(9, 0, &[0; 4]);
+        assert!(!s.has_piece(9), "still missing chunk 1");
+        s.put_chunk(9, 1, &[0; 4]);
+        assert!(s.has_piece(9), "both chunks present now");
+    }
+
+    #[test]
+    fn stores_a_piece_header_with_its_chunks() {
+        let mut s = store(1024);
+        let header = [0x41, 0xda, 0x91, 0x52, 0x26, 0x34, 0xc2, 0xee];
+
+        s.put_chunk_with_header(9, 0, header, &[0; 4]);
+        s.put_chunk_with_header(9, 1, header, &[1; 4]);
+
+        assert_eq!(s.piece_header(9), Some(header));
+    }
+
+    #[test]
+    fn evicts_piece_header_with_piece_data() {
+        let mut s = store(8);
+
+        s.put_chunk_with_header(1, 0, [1; 8], &[0; 4]);
+        s.put_chunk_with_header(1, 1, [1; 8], &[0; 4]);
+        s.put_chunk_with_header(2, 0, [2; 8], &[0; 4]);
+
+        assert_eq!(s.piece_header(1), None);
+        assert_eq!(s.piece_header(2), Some([2; 8]));
+    }
+
+    // ---- Disk backend ----
+
+    #[test]
+    fn disk_backend_round_trips_and_evicts() {
+        let dir = tempfile::tempdir().unwrap();
+        // piece_length 8, chunk_length 4, budget 8 bytes -> holds 1 piece (2 chunks).
+        let mut s = PieceStore::new_disk(8, 4, 8, dir.path().join("ih")).unwrap();
+        s.put_chunk_with_header(10, 0, [7u8; 8], &[1, 2, 3, 4]);
+        s.put_chunk(10, 1, &[5, 6, 7, 8]);
+        assert_eq!(s.chunk(10, 0).as_deref(), Some(&[1, 2, 3, 4][..]));
+        assert_eq!(s.chunk(10, 1).as_deref(), Some(&[5, 6, 7, 8][..]));
+        assert_eq!(s.piece_header(10), Some([7u8; 8]));
+        assert!(s.has_piece(10));
+        assert_eq!(s.have_pieces(), vec![10]);
+        assert_eq!(s.window(), Some((10, 10)));
+        assert!(dir.path().join("ih/10.piece").exists());
+
+        // Writing a second piece exceeds the 8-byte budget -> evict piece 10 (lowest).
+        s.put_chunk(11, 0, &[9, 9, 9, 9]);
+        assert!(!s.has_piece(10), "lowest piece evicted");
+        assert_eq!(s.chunk(10, 0).as_deref(), None, "evicted chunk unreadable");
+        assert!(
+            !dir.path().join("ih/10.piece").exists(),
+            "evicted file deleted"
+        );
+        assert!(dir.path().join("ih/11.piece").exists());
+    }
+
+    #[test]
+    fn disk_backend_wipes_stale_dir_on_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("ih");
+        // A prior run left a piece file behind.
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("99.piece"), b"stale").unwrap();
+
+        let s = PieceStore::new_disk(8, 4, 1024, cache.clone()).unwrap();
+        assert!(!cache.join("99.piece").exists(), "stale file wiped");
+        assert_eq!(s.window(), None, "index starts empty");
+    }
+
+    #[test]
+    fn disk_backend_fails_fast_on_unwritable_dir() {
+        // A path *under a file* (not a directory) cannot be created.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let bad = tmp.path().join("cannot/exist");
+        assert!(PieceStore::new_disk(8, 4, 8, bad).is_err());
+    }
+
+    #[test]
+    fn disk_backend_replacing_a_chunk_does_not_double_count_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = PieceStore::new_disk(8, 4, 8, dir.path().join("ih")).unwrap();
+        s.put_chunk(1, 0, &[0; 4]);
+        s.put_chunk(1, 0, &[9; 4]); // replace, not add
+        s.put_chunk(1, 1, &[0; 4]);
+        // Still one piece (1) with two chunks = 8 bytes, nothing evicted.
+        assert_eq!(s.chunk(1, 0).as_deref(), Some(&[9, 9, 9, 9][..]));
+        assert!(s.has_piece(1));
+    }
+
+    #[test]
+    fn with_backend_disk_matches_memory_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = PieceStore::with_backend(
+            8,
+            4,
+            1024,
+            BackendKind::Disk {
+                dir: dir.path().join("ih"),
+            },
+        )
+        .unwrap();
+        s.put_chunk(3, 0, &[1, 2, 3, 4]);
+        assert_eq!(s.chunk(3, 0).as_deref(), Some(&[1, 2, 3, 4][..]));
+        assert!(
+            !s.has_piece(3),
+            "partial piece (1 of 2 chunks) not complete"
+        );
+    }
+}
+
+// These tickets never contain borrowed or owned wire bytes.
+pub(crate) enum CompleteAdmission {
+    Immediate {
+        result: CompletePut,
+        wire_len: usize,
+    },
+    Memory {
+        guard: tokio::sync::OwnedMutexGuard<PieceStore>,
+        piece: u64,
+        wire_len: usize,
+    },
+    Disk {
+        handle: disk::DiskHandle,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        piece: u64,
+        wire_len: usize,
+        max: u64,
+        chunks: u16,
+        retention: Option<Duration>,
+    },
+}
+pub(crate) enum CompleteReceipt {
+    Ready(CompletePut),
+    Awaiting(tokio::sync::oneshot::Receiver<std::io::Result<CompletePut>>),
+}
+impl CompleteAdmission {
+    pub(crate) fn submit(self, header: [u8; 8], wire: &[u8]) -> std::io::Result<CompleteReceipt> {
+        match self {
+            Self::Immediate { result, wire_len } => {
+                if wire.len() != wire_len {
+                    return Err(std::io::ErrorKind::InvalidInput.into());
+                }
+                Ok(CompleteReceipt::Ready(result))
+            }
+            Self::Memory {
+                mut guard,
+                piece,
+                wire_len,
+            } => {
+                if wire.len() != wire_len {
+                    return Err(std::io::ErrorKind::InvalidInput.into());
+                }
+                guard
+                    .put_complete_memory(piece, header, wire)
+                    .map(CompleteReceipt::Ready)
+            }
+            Self::Disk {
+                handle,
+                permit,
+                piece,
+                wire_len,
+                max,
+                chunks,
+                retention,
+            } => {
+                if wire.len() != wire_len {
+                    return Err(std::io::ErrorKind::InvalidInput.into());
+                }
+                handle
+                    .submit_complete(permit, piece, header, wire, max, chunks, retention)
+                    .map(CompleteReceipt::Awaiting)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod admission_contracts {
+    use super::*;
+    use std::future::Future;
+    use std::task::Poll;
+
+    #[tokio::test]
+    async fn mutex_wait_cancel_and_reserved_memory_submit_keep_original_immutable() {
+        let store = Arc::new(Mutex::new(PieceStore::new(8, 4, 16)));
+        let held = store.lock().await;
+        let mut admission = Box::pin(PieceStore::begin_complete_admission(store.clone(), 1, 8));
+        assert!(matches!(
+            std::future::poll_fn(|cx| Poll::Ready(admission.as_mut().poll(cx))).await,
+            Poll::Pending
+        ));
+        drop(admission);
+        drop(held);
+        let reservation = PieceStore::begin_complete_admission(store.clone(), 1, 8)
+            .await
+            .unwrap();
+        assert!(store.try_lock().is_err());
+        drop(reservation);
+        assert!(store.try_lock().is_ok());
+        let reservation = PieceStore::begin_complete_admission(store.clone(), 1, 8)
+            .await
+            .unwrap();
+        assert!(matches!(
+            reservation.submit([1; 8], b"abcdefgh").unwrap(),
+            CompleteReceipt::Ready(CompletePut::Published)
+        ));
+        assert_eq!(
+            PieceStore::shared_block(&store, 1, 0, 8).await.unwrap(),
+            b"abcdefgh"
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoned_disk_reservation_never_copies_and_returns_shared_permit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(
+            PieceStore::new_disk(8, 4, 16, dir.path().join("cache")).unwrap(),
+        ));
+        let reservation = PieceStore::begin_complete_admission(store.clone(), 1, 8)
+            .await
+            .unwrap();
+        assert_eq!(store.lock().await.publication_budget(), (0, 0));
+        let mut next_generation =
+            Box::pin(PieceStore::begin_complete_admission(store.clone(), 1, 8));
+        assert!(matches!(
+            std::future::poll_fn(|cx| Poll::Ready(next_generation.as_mut().poll(cx))).await,
+            Poll::Pending
+        ));
+        assert_eq!(store.lock().await.publication_budget(), (0, 0));
+        drop(next_generation);
+        drop(reservation);
+        assert_eq!(store.lock().await.publication_budget(), (0, 1));
+        let reservation = PieceStore::begin_complete_admission(store.clone(), 1, 8)
+            .await
+            .unwrap();
+        assert!(reservation.submit([0; 8], b"short").is_err());
+        assert_eq!(store.lock().await.publication_budget(), (0, 1));
+    }
+}
+
+#[cfg(test)]
+mod generation_contract {
+    use super::*;
+    use std::{future::Future, task::Poll};
+    #[tokio::test]
+    async fn cancelled_admitted_command_keeps_shared_store_wire_until_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(
+            PieceStore::new_disk(8, 4, 16, dir.path().join("cache")).unwrap(),
+        ));
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let (release, gate) = std::sync::mpsc::channel();
+        store.lock().await.pause_publication(reached.clone(), gate);
+        let admission = PieceStore::begin_complete_admission(store.clone(), 1, 8)
+            .await
+            .unwrap();
+        let receipt = admission.submit([1; 8], b"abcdefgh").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), reached.notified())
+            .await
+            .unwrap();
+        drop(receipt);
+        assert_eq!(store.lock().await.publication_budget(), (8, 0));
+        assert!(!store.lock().await.has_piece(1));
+        let mut next = Box::pin(PieceStore::begin_complete_admission(store.clone(), 1, 8));
+        assert!(matches!(
+            std::future::poll_fn(|cx| Poll::Ready(next.as_mut().poll(cx))).await,
+            Poll::Pending
+        ));
+        assert_eq!(store.lock().await.publication_budget(), (8, 0));
+        drop(release);
+        let admission = tokio::time::timeout(Duration::from_secs(5), next)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.lock().await.publication_budget(), (0, 0));
+        let CompleteReceipt::Awaiting(done) = admission.submit([9; 8], b"XXXXXXXX").unwrap() else {
+            panic!("disk receipt")
+        };
+        assert_eq!(done.await.unwrap().unwrap(), CompletePut::AlreadyPresent);
+        assert_eq!(
+            PieceStore::shared_block(&store, 1, 0, 8).await.unwrap(),
+            b"abcdefgh"
+        );
+        assert_eq!(store.lock().await.publication_budget(), (0, 1));
+    }
+}
+
+// Test-only registration is keyed by the exact shared store, never by global timing.
+#[cfg(test)]
+pub(crate) mod reciprocal_lock_witness {
+    use super::*;
+    static HOOKS: std::sync::Mutex<BTreeMap<usize, Arc<tokio::sync::Notify>>> =
+        std::sync::Mutex::new(BTreeMap::new());
+    pub(crate) struct Registration(usize);
+    impl Drop for Registration {
+        fn drop(&mut self) {
+            HOOKS.lock().unwrap().remove(&self.0);
+        }
+    }
+    pub(crate) fn register(
+        store: &Arc<Mutex<PieceStore>>,
+    ) -> (Registration, Arc<tokio::sync::Notify>) {
+        let key = Arc::as_ptr(store) as usize;
+        let notify = Arc::new(tokio::sync::Notify::new());
+        assert!(HOOKS.lock().unwrap().insert(key, notify.clone()).is_none());
+        (Registration(key), notify)
+    }
+    pub(super) fn pending(store: &Arc<Mutex<PieceStore>>) {
+        if let Some(notify) = HOOKS.lock().unwrap().get(&(Arc::as_ptr(store) as usize)) {
+            notify.notify_one();
+        }
+    }
+}

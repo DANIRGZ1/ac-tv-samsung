@@ -1,0 +1,11 @@
+.agents
+.codex
+.git
+.github
+docs
+re
+references
+target
+tests
+tools/*
+!tools/swarmtest

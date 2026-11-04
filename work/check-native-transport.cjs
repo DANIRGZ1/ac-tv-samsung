@@ -1,0 +1,11 @@
+const fs=require('fs'),vm=require('vm'),assert=require('assert/strict');let receive,frame,now=1;const specs=[];
+class FakeDate extends Date{static now(){return now}}
+const document={createElement(){const e={setAttribute(){},remove(){},contentWindow:{postMessage(d){if(d.start)specs.push(d)}}};frame=e;return e},body:{appendChild(e){e.onload()}}};
+const window={addEventListener(n,f){receive=f},removeEventListener(){}};const context={window,document,crypto:require('crypto').webcrypto,Date:FakeDate,Uint8Array,Array,Object,Number,Error,String,Promise,setTimeout(){return 1},clearTimeout(){}};
+vm.runInNewContext(fs.readFileSync('work/acetv-native-app/native-transport.js','utf8'),context);const api=window.NativeP2PTransport;
+function send(payload){receive({source:frame.contentWindow,data:{aceNativeEvent:true,key:specs.at(-1).key,payload}})}
+async function start(id='a'.repeat(40)){const p=api.start({contentId:id,identifierKind:'infohash'});return {p}}
+(async()=>{let s=await start();assert.equal(specs.at(-1).start.preferredPeer,null);send({type:'peer-verified',peer:{host:'8.8.8.8',port:7777}});send({type:'local-stream',url:'http://127.0.0.1:1234/'+'a'.repeat(32)+'.ts'});await s.p;
+s=await start();assert.equal(specs.at(-1).start.preferredPeer.host,'8.8.8.8','verified peer is reused when returning to same channel');send({type:'local-stream',url:'http://127.0.0.1:1234/'+'a'.repeat(32)+'.ts'});await s.p;api.invalidate();s=await start();assert.equal(specs.at(-1).start.preferredPeer,null,'freeze/error evicts peer hint');send({type:'peer-verified',peer:{host:'8.8.4.4',port:7778}});send({type:'local-stream',url:'http://127.0.0.1:1234/'+'a'.repeat(32)+'.ts'});await s.p;
+now+=120001;s=await start();assert.equal(specs.at(-1).start.preferredPeer,null,'peer hints expire');send({type:'local-stream',url:'http://127.0.0.1:1234/'+'a'.repeat(32)+'.ts'});await s.p;
+s=await start('b'.repeat(40));assert.equal(specs.at(-1).start.preferredPeer,null,'hint never crosses channel identifiers');send({type:'local-stream',url:'http://127.0.0.1:1234/'+'a'.repeat(32)+'.ts'});await s.p;api.stop();console.log('PASS verified peer cache, invalidation, expiry and channel isolation');})().catch(e=>{console.error(e);process.exitCode=1});

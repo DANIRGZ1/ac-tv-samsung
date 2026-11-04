@@ -1,0 +1,189 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+      - "!v*.*.*-*"
+
+permissions:
+  contents: read
+
+env:
+  BIN_NAME: outpace
+  CARGO_TERM_COLOR: always
+  IMAGE_NAME: ghcr.io/jamezrin/outpace
+
+jobs:
+  release-metadata:
+    name: Validate release tag against Cargo metadata
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Read Cargo version and validate release tag
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cargo_version="$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "ace-engine") | .version')"
+
+          if [[ -z "$cargo_version" || "$cargo_version" == "null" ]]; then
+            echo "::error::Could not read the ace-engine version from cargo metadata."
+            exit 1
+          fi
+
+          tag="$GITHUB_REF_NAME"
+          expected="v${cargo_version}"
+          if [[ "$tag" != "$expected" ]]; then
+            echo "::error::Release tag ${tag} does not match the Cargo version (expected ${expected}). Update the [workspace.package] version in Cargo.toml or retag."
+            exit 1
+          fi
+
+          echo "version=${cargo_version}" >> "$GITHUB_OUTPUT"
+          echo "Release version (from Cargo metadata): ${cargo_version}"
+
+  build-binaries:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    needs: release-metadata
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+            archive: tar.gz
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04
+            archive: tar.gz
+          - target: armv7-unknown-linux-musleabihf
+            os: ubuntu-24.04
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-15
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-2025
+            archive: zip
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+            archive: zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          target: ${{ matrix.target }}
+          cache: false
+          build-warnings: ""
+
+      - name: Install Linux cross toolchain
+        if: contains(matrix.target, 'unknown-linux-musl')
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Test Windows executable resolution
+        if: contains(matrix.target, 'windows')
+        shell: bash
+        run: cargo test --locked -p ace-engine --lib --target "${{ matrix.target }}" executable_resolution_tests
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          cargo build --locked --release -p ace-engine --bin "$BIN_NAME" --target "${{ matrix.target }}"
+
+      - name: Package binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.release-metadata.outputs.version }}"
+          target="${{ matrix.target }}"
+          binary="target/${target}/release/${BIN_NAME}"
+
+          if [[ "$target" == *windows* ]]; then
+            binary="${binary}.exe"
+          fi
+
+          package_dir="dist/${BIN_NAME}-${version}-${target}"
+          mkdir -p "$package_dir"
+          cp "$binary" "$package_dir/"
+          cp LICENSE README.md "$package_dir/"
+
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            powershell -NoProfile -Command "Compress-Archive -Path '${package_dir}' -DestinationPath 'dist/${BIN_NAME}-${version}-${target}.zip' -Force"
+          else
+            tar -C dist -czf "dist/${BIN_NAME}-${version}-${target}.tar.gz" "${BIN_NAME}-${version}-${target}"
+          fi
+
+      - name: Upload packaged binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/${{ env.BIN_NAME }}-${{ needs.release-metadata.outputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
+          if-no-files-found: error
+          compression-level: 0
+
+  publish-release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-24.04
+    needs:
+      - release-metadata
+      - build-binaries
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Download packaged binaries
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum outpace-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          files: |
+            dist/outpace-*
+            dist/SHA256SUMS
+
+  publish-container:
+    name: Publish GHCR image from release archives
+    # publish-release depends on all seven binary builds succeeding.
+    needs: publish-release
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/publish-container.yml
+    with:
+      tag: ${{ github.ref_name }}

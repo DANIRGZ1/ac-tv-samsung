@@ -1,0 +1,1742 @@
+//! Resolve a stream identifier to a downloadable [`StreamInfo`].
+//!
+//! Every live [`StreamInfo`] comes from a decoded `AceStreamTransport` descriptor
+//! ([`stream_info_from_transport`]): the descriptor supplies the swarm infohash, geometry,
+//! trackers and source pubkey. The descriptor is located by content id through the signed
+//! catalog or fetched from a transport-file URL. Explicitly opted-in callers may also use
+//! BEP-9 for the outpace raw-transport-hash namespace; this is not a verified derivation of
+//! public catalog content ids. A bare
+//! infohash carries no geometry, so it is never turned into a `StreamInfo` by guessing
+//! (issue #164); callers keep descriptors they have verified in an [`InfohashIndex`].
+
+use crate::http_fetch::{self, FetchError, FetchLimits, FetchPolicy, FetchUrl, GuardedBody};
+#[cfg(test)]
+use crate::http_fetch::{is_private_or_loopback, is_safe_ip};
+use crate::types::{StreamInfo, StreamMetadata, VodInfo};
+use ace_peer::session::PeerSession;
+use ace_wire::extended::{ExtendedHandshake, NodeFields, OutgoingExtendedHandshake};
+use ace_wire::handshake::random_peer_id;
+use ace_wire::identity::Identity;
+use ace_wire::infohash::{infohash_of_decoded_transport, transport_file_hash};
+use ace_wire::message::PeerMessage;
+use ace_wire::transport::decode_transport;
+use base64ct::{Base64, Encoding};
+use rand::RngExt;
+use sha1::{Digest, Sha1};
+use std::collections::{HashMap, VecDeque};
+#[cfg(test)]
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
+
+/// The fixed Acestream chunk size (16 KiB) that the wire codec and every descriptor use.
+pub const DEFAULT_CHUNK_LENGTH: u64 = 16_384;
+
+/// Upper bound on a metadata-swarm peer's advertised `metadata_size` (bytes).
+///
+/// The `metadata_size` in a peer's extended handshake is untrusted: it drives both the BEP-9
+/// request fan-out (one request per 16 KiB block) and a `vec![0u8; metadata_size]` allocation
+/// before any transport descriptor is decoded. Acestream `AceStreamTransport` files are small
+/// bencoded dicts (geometry + trackers + pubkey), far under this ceiling — which also matches
+/// the 1 MiB limit the signed catalog path imposes on the same descriptor. Anything larger is
+/// a hostile peer trying to force a large fan-out/allocation, and is rejected before the fetch.
+pub const MAX_METADATA_SIZE: usize = 1_048_576;
+
+/// Upper bound on a transport descriptor's advertised `piece_length` (bytes).
+///
+/// The piece length is untrusted and sizes the [`PieceReassembler`](ace_wire::reassembly)
+/// per-piece buffer (`vec![0u8; piece_length]`, allocated on the first block of every
+/// in-flight piece) as well as the request fan-out. Real Acestream geometry is small: 64 KiB
+/// source-node pieces (`broadcast::PIECE_LENGTH`) and 512 KiB-1 MiB public live pieces. This
+/// ceiling leaves generous headroom for higher-bitrate sources while bounding the allocation a
+/// hostile transport can force at stream start.
+pub const MAX_PIECE_LENGTH: u64 = 8 * 1_048_576;
+const MAX_TITLE_BYTES: usize = 256;
+
+/// The ext id we assign to `ut_metadata` in our `m` dict (what the peer addresses replies to).
+const OUR_UT_METADATA_ID: i64 = 2;
+/// How many messages to read while waiting for the peer's extended handshake.
+const HANDSHAKE_READ_BUDGET: usize = 32;
+/// Official catalog hosts observed from the Linux engine's first `content_id` resolution.
+const CATALOG_HOSTS: &[(&str, u16)] = &[
+    ("5.252.161.191", 8081),
+    ("77.120.105.88", 8081),
+    ("64.227.119.64", 8081),
+    ("163.172.187.185", 8081),
+];
+const CATALOG_HOST_TIMEOUT: Duration = Duration::from_secs(4);
+const CATALOG_RESPONSE_LIMIT: usize = 1024 * 1024;
+const CATALOG_SIGNING_SECRET: &[u8] =
+    b"H!+:H1NnvvX\\x0bS'(;0/A\\nR{${\\n/3%1\\x0b*[r0o>QzNGKkXT@v\\x0b3DN;gx_66L2 {`F0,\\tKm>XoG~iY(\\x0bu]6E}\\t~07&H;9qE1d?d-A7S(";
+
+// TSService.get_key(2), the response counterpart of get_key(1) above.
+// Public protocol interoperability constant, not a private server credential.
+const CATALOG_RESPONSE_KEY: &[u8] = b"CNVU\\\\w5S/HGg\"pSzY&O\"`uGCD18\\x0cfS|h2H4eJBihWumSD7zSv;8,=z2?<\\tl6ka\\n\\x0c*O<3dzOZ|MT11]f0 Xuc| R\"$D;SsYm\\rw*..8h7d4k";
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ResolveError {
+    BadInfohash,
+    Transport(&'static str),
+    /// A signed catalog request/response step failed during content-id resolution.
+    Catalog(&'static str),
+    /// A peer/network step failed during content-id resolution.
+    Peer(&'static str),
+    /// A transport-file `url=` fetch failed a safety check or the network step.
+    Url(&'static str),
+}
+
+fn normalized_title(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let mut end = value.len().min(MAX_TITLE_BYTES);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(value[..end].to_string())
+}
+
+/// Build a [`StreamInfo`] from raw `AceStreamTransport` file bytes (the pure half of
+/// content-id resolution): official swarm infohash + geometry + trackers from the descriptor.
+pub fn stream_info_from_transport(bytes: &[u8]) -> Result<StreamInfo, ResolveError> {
+    let d = decode_transport(bytes).map_err(|_| ResolveError::Transport("decode failed"))?;
+    validate_geometry(d.piece_length, d.chunk_length)?;
+    // A valid RSA pubkey => pieces carry a modulus-length signature tail to strip *and* a key
+    // to verify each piece's in-band signature against (issue #10); no parseable pubkey =>
+    // treat pieces as unsigned (don't strip, nothing to verify).
+    let sig_len = ace_wire::live_auth::signature_len_from_pubkey_der(&d.pubkey);
+    let infohash = infohash_of_decoded_transport(&d)
+        .map_err(|_| ResolveError::Transport("infohash failed"))?;
+    let metadata = StreamMetadata {
+        title: normalized_title(&d.name),
+        bitrate: d
+            .bitrate
+            .and_then(|value| u64::try_from(value).ok())
+            .filter(|value| *value > 0),
+        categories: d.categories,
+    };
+    Ok(StreamInfo {
+        infohash,
+        piece_length: d.piece_length,
+        chunk_length: d.chunk_length,
+        trackers: d.trackers,
+        metadata,
+        sig_len: sig_len.unwrap_or(0),
+        source_pubkey: if sig_len.is_some() {
+            d.pubkey
+        } else {
+            Vec::new()
+        },
+    })
+}
+
+/// Build a [`VodInfo`] from bare or original-disk-enveloped torrent metainfo, or legacy
+/// `AceStreamTransport` bytes (the pure half of VOD resolution). Metainfo uses the original
+/// encoded `info` bytes for identity and standard BitTorrent peer handshakes. Legacy wrapped
+/// descriptors retain AceStream peer handshakes and their existing identity formula.
+///
+/// Errors if the descriptor is live (no `pieces`), advertises a multi-file layout (`files`
+/// present — intentionally unsupported), fails geometry validation, or lacks a single-file
+/// `length`.
+pub fn vod_info_from_transport(bytes: &[u8]) -> Result<VodInfo, ResolveError> {
+    if !ace_wire::infohash::is_transport_file(bytes) {
+        let metainfo = if ace_wire::disk_envelope::is_disk_envelope(bytes) {
+            // A recognized envelope is terminal: never retry bare or legacy decoding.
+            ace_wire::disk_envelope::decode_disk_metainfo(bytes)
+        } else {
+            ace_wire::metainfo::decode_metainfo(bytes)
+        }
+        .map_err(|_| ResolveError::Transport("invalid single-file metainfo"))?;
+        validate_geometry(metainfo.piece_length, DEFAULT_CHUNK_LENGTH)?;
+        return Ok(VodInfo {
+            infohash: metainfo.infohash,
+            peer_protocol: ace_wire::handshake::HandshakeProtocol::BitTorrent,
+            piece_length: metainfo.piece_length,
+            chunk_length: DEFAULT_CHUNK_LENGTH,
+            trackers: metainfo.trackers,
+            piece_hashes: metainfo.piece_hashes,
+            total_length: metainfo.total_length,
+        });
+    }
+    let d = decode_transport(bytes).map_err(|_| ResolveError::Transport("decode failed"))?;
+    if d.is_live {
+        return Err(ResolveError::Transport("not a VOD transport (no pieces)"));
+    }
+    if d.is_multifile() {
+        return Err(ResolveError::Transport("multi-file VOD is not supported"));
+    }
+    validate_geometry(d.piece_length, d.chunk_length)?;
+    let total_length = d
+        .vod_total_length()
+        .ok_or(ResolveError::Transport("VOD descriptor missing length"))?;
+    Ok(VodInfo {
+        infohash: infohash_of_decoded_transport(&d)
+            .map_err(|_| ResolveError::Transport("infohash failed"))?,
+        peer_protocol: ace_wire::handshake::HandshakeProtocol::AceStream,
+        piece_length: d.piece_length,
+        chunk_length: d.chunk_length,
+        trackers: d.trackers,
+        piece_hashes: d.pieces,
+        total_length,
+    })
+}
+
+/// Validate untrusted transport geometry before it becomes a [`StreamInfo`].
+///
+/// `piece_length`/`chunk_length` come from a metadata-swarm peer's transport descriptor. The
+/// wire codec addresses chunks within a piece by a `u16` index and assumes the fixed Acestream
+/// chunk size, so a downloadable descriptor must satisfy:
+/// - `chunk_length == DEFAULT_CHUNK_LENGTH` — the 16 KiB protocol constant the wire codec and
+///   both live/broadcast paths use; any other value is rejected rather than trusted.
+/// - `piece_length <= MAX_PIECE_LENGTH` — bounds the per-piece reassembly allocation.
+/// - `piece_length` is an exact multiple of `chunk_length` — whole chunks per piece, so request
+///   generation stays consistent with the descriptor.
+/// - `piece_length / chunk_length <= u16::MAX` — the chunks-per-piece count must fit the wire
+///   chunk index without truncation (see [`StreamInfo::chunks_per_piece`]).
+fn validate_geometry(piece_length: u64, chunk_length: u64) -> Result<(), ResolveError> {
+    if chunk_length != DEFAULT_CHUNK_LENGTH {
+        return Err(ResolveError::Transport("unexpected chunk_length"));
+    }
+    if piece_length > MAX_PIECE_LENGTH {
+        return Err(ResolveError::Transport("piece_length too large"));
+    }
+    if !piece_length.is_multiple_of(chunk_length) {
+        return Err(ResolveError::Transport(
+            "piece_length not a multiple of chunk_length",
+        ));
+    }
+    if piece_length / chunk_length > u16::MAX as u64 {
+        return Err(ResolveError::Transport("too many chunks per piece"));
+    }
+    Ok(())
+}
+
+/// Decode a 40-hex content-id/infohash into 20 bytes (the metadata-swarm handshake key).
+pub fn hex20(hex: &str) -> Result<[u8; 20], ResolveError> {
+    decode_hex20(hex).ok_or(ResolveError::BadInfohash)
+}
+
+/// Encode a 20-byte infohash/content-id as canonical lowercase hex.
+pub fn infohash_hex(infohash: &[u8; 20]) -> String {
+    hex::encode(&infohash[..])
+}
+
+/// Resolve an outpace raw-transport-hash identifier to a [`StreamInfo`] over an
+/// already-connected peer, fetching `AceStreamTransport` metadata via BEP-9 `ut_metadata`.
+///
+/// `handshake_infohash` must be SHA-1 of the complete wrapped transport bytes. This convention
+/// is used by outpace broadcasts; public catalog content ids are not known to follow it.
+/// The returned `StreamInfo` carries the distinct descriptor-derived swarm infohash, geometry
+/// and trackers. This low-level function does not apply the daemon's opt-in policy.
+pub async fn resolve_via_peer<S: AsyncRead + AsyncWrite + Unpin>(
+    session: &mut PeerSession<S>,
+    handshake_infohash: [u8; 20],
+    identity: &Identity,
+) -> Result<StreamInfo, ResolveError> {
+    stream_info_from_transport(
+        &transport_bytes_via_peer(session, handshake_infohash, identity).await?,
+    )
+}
+
+/// Fetch the raw `AceStreamTransport` metadata bytes over a peer via BEP-9 `ut_metadata`. The
+/// pure decode half is left to the caller ([`stream_info_from_transport`] for live,
+/// [`vod_info_from_transport`] for VOD).
+///
+/// After the fetch, SHA-1 of the raw wrapped blob must equal `handshake_infohash`, rejecting
+/// substitution in the outpace raw-hash namespace. This does not implement a general public
+/// catalog content-id derivation, nor grant catalog provenance to peer-supplied trackers.
+pub async fn transport_bytes_via_peer<S: AsyncRead + AsyncWrite + Unpin>(
+    session: &mut PeerSession<S>,
+    handshake_infohash: [u8; 20],
+    identity: &Identity,
+) -> Result<Vec<u8>, ResolveError> {
+    session
+        .perform_handshake(handshake_infohash, random_peer_id())
+        .await
+        .map_err(|_| ResolveError::Peer("BT handshake failed"))?;
+
+    let hs = OutgoingExtendedHandshake {
+        ace_metadata_version: 1,
+        ut_metadata_id: OUR_UT_METADATA_ID,
+        mi: None,
+        node: NodeFields {
+            ts: 5000,
+            ..NodeFields::default()
+        },
+        peer_ip: None,
+        metadata_size: None,
+    };
+    session
+        .send_signed_extended_handshake(&hs, identity)
+        .await
+        .map_err(|_| ResolveError::Peer("send extended handshake failed"))?;
+
+    let (peer_ut_id, metadata_size) = read_metadata_params(session).await?;
+    let blob = session
+        .fetch_metadata(peer_ut_id, metadata_size)
+        .await
+        .map_err(|_| ResolveError::Peer("ut_metadata fetch failed"))?;
+    if !checked_transport_file_hash(&blob, handshake_infohash) {
+        return Err(ResolveError::Peer("metadata hash mismatch"));
+    }
+    Ok(blob)
+}
+
+/// Resolve a content-id through the official signed transport catalog.
+///
+/// The catalog returns encrypted `AceStreamTransport` bytes. Response signature, request
+/// nonce and checksum checks precede transport decoding. The embedded shared key matches
+/// engine verification but does not establish server-only authenticity; see protocol note 62.
+pub async fn resolve_via_catalog(content_id: &str) -> Result<StreamInfo, ResolveError> {
+    stream_info_from_transport(&catalog_transport_bytes(content_id).await?)
+}
+
+/// Resolve a swarm infohash using the engine's signed, padded-Base64 catalog query.
+/// Authentication precedes decoding; the returned descriptor must bind the requested hash.
+pub async fn resolve_infohash_via_catalog(infohash: &str) -> Result<StreamInfo, ResolveError> {
+    let requested = hex20(infohash)?;
+    let value = Base64::encode_string(&requested);
+    let bytes = catalog_transport_bytes_query("infohash", &value).await?;
+    catalog_infohash_info(&bytes, requested)
+}
+
+/// Fetch the raw (encrypted) `AceStreamTransport` bytes for `content_id` from the signed
+/// catalog, trying each catalog host in turn. The pure decode half is left to the caller
+/// ([`stream_info_from_transport`] for live, [`vod_info_from_transport`] for VOD).
+pub async fn catalog_transport_bytes(content_id: &str) -> Result<Vec<u8>, ResolveError> {
+    hex20(content_id)?;
+    catalog_transport_bytes_query("pid", content_id).await
+}
+
+async fn catalog_transport_bytes_query(
+    parameter: &str,
+    value: &str,
+) -> Result<Vec<u8>, ResolveError> {
+    let mut last = ResolveError::Catalog("catalog request failed");
+    for &(host, port) in CATALOG_HOSTS {
+        match tokio::time::timeout(
+            CATALOG_HOST_TIMEOUT,
+            fetch_catalog_transport_query(host, port, parameter, value),
+        )
+        .await
+        {
+            Ok(Ok(transport)) => return Ok(transport),
+            Ok(Err(e)) => last = e,
+            Err(_) => last = ResolveError::Catalog("catalog timeout"),
+        }
+    }
+    Err(last)
+}
+
+#[cfg(test)]
+async fn fetch_catalog_transport(
+    host: &str,
+    port: u16,
+    content_id: &str,
+) -> Result<Vec<u8>, ResolveError> {
+    fetch_catalog_transport_query(host, port, "pid", content_id).await
+}
+
+async fn fetch_catalog_transport_query(
+    host: &str,
+    port: u16,
+    parameter: &str,
+    value: &str,
+) -> Result<Vec<u8>, ResolveError> {
+    let request_random = {
+        let mut rng = rand::rng();
+        rng.random_range(1..=i64::MAX as u64)
+    };
+    let signature = catalog_query_signature(parameter, value, request_random);
+    // Sign raw values, then form-encode them. In particular a Base64 '+' must not
+    // become a space when the server decodes the query.
+    let mut url = reqwest::Url::parse("http://catalog.example.invalid/gettorrent")
+        .expect("constant catalog URL");
+    url.query_pairs_mut()
+        .append_pair("_n", "3.2.11")
+        .append_pair("_p", "linux")
+        .append_pair("_r", &request_random.to_string())
+        .append_pair("_v", "3021100")
+        .append_pair(parameter, value)
+        .append_pair("_s", &signature);
+    let path = format!("{}?{}", url.path(), url.query().expect("catalog query"));
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: outpace/0.1\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+    );
+
+    let mut stream = TcpStream::connect((host, port))
+        .await
+        .map_err(|_| ResolveError::Catalog("catalog connect failed"))?;
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|_| ResolveError::Catalog("catalog write failed"))?;
+
+    let mut response = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = stream
+            .read(&mut buf)
+            .await
+            .map_err(|_| ResolveError::Catalog("catalog read failed"))?;
+        if n == 0 {
+            break;
+        }
+        if response.len() + n > CATALOG_RESPONSE_LIMIT {
+            return Err(ResolveError::Catalog("catalog response too large"));
+        }
+        response.extend_from_slice(&buf[..n]);
+    }
+
+    let body = http_response_body(&response)?;
+    catalog_response_transport(&body, request_random)
+}
+
+fn catalog_infohash_info(bytes: &[u8], requested: [u8; 20]) -> Result<StreamInfo, ResolveError> {
+    let info = stream_info_from_transport(bytes)?;
+    if info.infohash != requested {
+        return Err(ResolveError::Catalog("catalog infohash mismatch"));
+    }
+    Ok(info)
+}
+
+#[cfg(test)]
+fn catalog_signature(content_id: &str, request_random: u64) -> String {
+    catalog_query_signature("pid", content_id, request_random)
+}
+
+fn catalog_query_signature(parameter: &str, value: &str, request_random: u64) -> String {
+    let mut hasher = Sha1::new();
+    let signed = format!("_n=3.2.11#_p=linux#_r={request_random}#_v=3021100#{parameter}={value}");
+    hasher.update(signed.as_bytes());
+    hasher.update(CATALOG_SIGNING_SECRET);
+    hex::encode(hasher.finalize())
+}
+
+fn catalog_response_transport(body: &[u8], request_random: u64) -> Result<Vec<u8>, ResolveError> {
+    if body.len() > CATALOG_RESPONSE_LIMIT {
+        return Err(ResolveError::Catalog("catalog response too large"));
+    }
+    let xml = std::str::from_utf8(body).map_err(|_| ResolveError::Catalog("bad catalog utf-8"))?;
+    // Parse the whole document: substring searches can mistake comments, nested elements,
+    // duplicate attributes or a second root for the response being authenticated.
+    let document = roxmltree::Document::parse_with_options(
+        xml,
+        roxmltree::ParsingOptions {
+            allow_dtd: false,
+            nodes_limit: 4096,
+            ..Default::default()
+        },
+    )
+    .map_err(|_| ResolveError::Catalog("bad catalog xml"))?;
+    let root = document.root_element();
+    if !root.has_tag_name("response") {
+        return Err(ResolveError::Catalog("bad catalog response root"));
+    }
+    let signature = root
+        .attribute_node("sig")
+        .ok_or(ResolveError::Catalog("missing catalog signature"))?;
+    let expected_signature = signature.value();
+    if expected_signature.len() != 40
+        || !expected_signature
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(ResolveError::Catalog("bad catalog signature"));
+    }
+    // The engine signs the original response text, removing the literal ` sig="..."`.
+    // Never reserialize XML or normalize whitespace: those bytes are signed too.
+    let attribute = format!(" sig=\"{expected_signature}\"");
+    let range = signature.range();
+    if range.start == 0 || xml.get(range.start - 1..range.end) != Some(attribute.as_str()) {
+        return Err(ResolveError::Catalog("bad catalog signature attribute"));
+    }
+    let unsigned = xml.replace(&attribute, "");
+    let mut hasher = Sha1::new();
+    hasher.update(unsigned.as_bytes());
+    hasher.update(CATALOG_RESPONSE_KEY);
+    if hex::encode(hasher.finalize()) != expected_signature {
+        return Err(ResolveError::Catalog("catalog signature mismatch"));
+    }
+    let response_random = root
+        .attribute("r")
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or(ResolveError::Catalog("bad catalog random"))?;
+    if response_random != request_random {
+        return Err(ResolveError::Catalog("catalog random mismatch"));
+    }
+    let field = |tag| {
+        let mut elements = root.children().filter(|child| child.has_tag_name(tag));
+        let element = elements
+            .next()
+            .ok_or(ResolveError::Catalog("missing catalog tag"))?;
+        if elements.next().is_some() || element.children().any(|child| child.is_element()) {
+            return Err(ResolveError::Catalog("ambiguous catalog tag"));
+        }
+        element
+            .text()
+            .ok_or(ResolveError::Catalog("empty catalog tag"))
+    };
+    let torrent = field("torrent")?.trim();
+    let checksum = field("checksum")?.trim();
+    let expected = decode_hex20(checksum).ok_or(ResolveError::Catalog("bad checksum"))?;
+    let transport = Base64::decode_vec(torrent)
+        .map_err(|_| ResolveError::Catalog("bad catalog torrent base64"))?;
+
+    if !checked_transport_file_hash(&transport, expected) {
+        return Err(ResolveError::Catalog("checksum mismatch"));
+    }
+    Ok(transport)
+}
+
+fn http_response_body(response: &[u8]) -> Result<Vec<u8>, ResolveError> {
+    let header_end = response
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or(ResolveError::Catalog("bad catalog http response"))?;
+    let headers = std::str::from_utf8(&response[..header_end])
+        .map_err(|_| ResolveError::Catalog("bad catalog http headers"))?;
+    let mut lines = headers.split("\r\n");
+    let status = lines
+        .next()
+        .ok_or(ResolveError::Catalog("missing catalog http status"))?;
+    if !status.starts_with("HTTP/") || !status.contains(" 200 ") {
+        return Err(ResolveError::Catalog("catalog http status"));
+    }
+    let chunked = lines.any(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.starts_with("transfer-encoding:") && lower.contains("chunked")
+    });
+    let body = &response[header_end + 4..];
+    if chunked {
+        decode_chunked_body(body)
+    } else {
+        Ok(body.to_vec())
+    }
+}
+
+fn decode_chunked_body(mut body: &[u8]) -> Result<Vec<u8>, ResolveError> {
+    let mut out = Vec::new();
+    loop {
+        let line_end = find_crlf(body).ok_or(ResolveError::Catalog("bad chunk size"))?;
+        let size_line = std::str::from_utf8(&body[..line_end])
+            .map_err(|_| ResolveError::Catalog("bad chunk size"))?;
+        let size = usize::from_str_radix(size_line.split(';').next().unwrap_or("").trim(), 16)
+            .map_err(|_| ResolveError::Catalog("bad chunk size"))?;
+        body = &body[line_end + 2..];
+
+        if size == 0 {
+            return Ok(out);
+        }
+        if body.len() < size + 2 {
+            return Err(ResolveError::Catalog("truncated chunk"));
+        }
+        out.extend_from_slice(&body[..size]);
+        if &body[size..size + 2] != b"\r\n" {
+            return Err(ResolveError::Catalog("bad chunk terminator"));
+        }
+        body = &body[size + 2..];
+    }
+}
+
+fn find_crlf(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(2).position(|w| w == b"\r\n")
+}
+
+/// Read messages until the peer's extended handshake arrives; extract its `ut_metadata` ext id
+/// and advertised `metadata_size`.
+async fn read_metadata_params<S: AsyncRead + AsyncWrite + Unpin>(
+    session: &mut PeerSession<S>,
+) -> Result<(u8, usize), ResolveError> {
+    for _ in 0..HANDSHAKE_READ_BUDGET {
+        let msg = session
+            .read_message()
+            .await
+            .map_err(|_| ResolveError::Peer("closed before extended handshake"))?;
+        if let PeerMessage::Extended { ext_id: 0, payload } = msg {
+            let eh = ExtendedHandshake::parse(&payload)
+                .map_err(|_| ResolveError::Peer("bad extended handshake"))?;
+            let ut_id = eh
+                .ut_metadata_id()
+                .ok_or(ResolveError::Peer("peer has no ut_metadata"))?;
+            let size = eh
+                .metadata_size()
+                .ok_or(ResolveError::Peer("peer sent no metadata_size"))?;
+            if !(0..=255).contains(&ut_id) {
+                return Err(ResolveError::Peer("invalid ut_metadata params"));
+            }
+            return Ok((ut_id as u8, checked_metadata_size(size)?));
+        }
+    }
+    Err(ResolveError::Peer("no extended handshake"))
+}
+
+/// Validate a peer-advertised `metadata_size` before it drives a BEP-9 fetch/allocation.
+///
+/// Rejects non-positive sizes and anything above [`MAX_METADATA_SIZE`] (a hostile peer trying
+/// to force a large request fan-out / allocation before any descriptor is decoded).
+fn checked_metadata_size(size: i64) -> Result<usize, ResolveError> {
+    if size <= 0 || size > MAX_METADATA_SIZE as i64 {
+        return Err(ResolveError::Peer("invalid ut_metadata params"));
+    }
+    Ok(size as usize)
+}
+
+/// Whether `blob` is the transport file identified by `expected` (SHA-1 of the raw bytes).
+///
+/// Catalog checksums identify the raw transport bytes, not necessarily the requested content
+/// id. BEP-9 callers deliberately opt into the outpace raw-hash namespace (protocol note 63).
+fn checked_transport_file_hash(blob: &[u8], expected: [u8; 20]) -> bool {
+    transport_file_hash(blob) == expected
+}
+
+/// A small TTL cache of resolved `content-id → StreamInfo` so repeated `open()`s of the same
+/// stream don't re-fetch metadata.
+pub struct ResolveCache {
+    entries: Mutex<HashMap<String, (StreamInfo, Instant)>>,
+    ttl: Duration,
+}
+
+impl ResolveCache {
+    pub fn new(ttl: Duration) -> Self {
+        ResolveCache {
+            entries: Mutex::new(HashMap::new()),
+            ttl,
+        }
+    }
+
+    /// Return a cached, unexpired `StreamInfo` for `key`, if any.
+    pub fn get(&self, key: &str) -> Option<StreamInfo> {
+        let map = self.entries.lock().unwrap();
+        map.get(key)
+            .and_then(|(info, at)| (at.elapsed() < self.ttl).then(|| info.clone()))
+    }
+
+    /// Store `info` under `key` with the current time.
+    pub fn put(&self, key: &str, info: StreamInfo) {
+        self.entries
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), (info, Instant::now()));
+    }
+}
+
+/// Verified live descriptors keyed by their swarm infohash (issue #164).
+///
+/// Deliberately separate from [`ResolveCache`], which is keyed by the content-id *string*:
+/// content ids and infohashes share the 40-hex space, so a shared map could hand one kind of
+/// id's entry to a lookup of the other. Every entry here is keyed by its own `info.infohash`,
+/// which [`stream_info_from_transport`] computed from the same descriptor that supplied the
+/// geometry and pubkey. The swarm infohash commits to `piece_length`, `chunk_length` and
+/// `pubkey` (see [`infohash_of_decoded_transport`]), so an entry can neither pair an infohash with
+/// another stream's geometry nor go stale. Entries therefore carry no TTL; the index is bounded
+/// by evicting the least recently stored entry once `capacity` is reached.
+pub struct InfohashIndex {
+    entries: Mutex<VecDeque<StreamInfo>>,
+    capacity: usize,
+}
+
+impl InfohashIndex {
+    /// An empty index holding at most `capacity` descriptors (at least one).
+    pub fn new(capacity: usize) -> Self {
+        InfohashIndex {
+            entries: Mutex::new(VecDeque::new()),
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// Record a verified descriptor under `info.infohash`, replacing any previous entry for that
+    /// infohash and evicting the least recently stored entry when full.
+    pub fn put(&self, info: StreamInfo) {
+        let mut entries = self.entries.lock().unwrap();
+        entries.retain(|e| e.infohash != info.infohash);
+        if entries.len() >= self.capacity {
+            entries.pop_front();
+        }
+        entries.push_back(info);
+    }
+
+    /// The verified descriptor stored for `infohash`, if any.
+    pub fn get(&self, infohash: &[u8; 20]) -> Option<StreamInfo> {
+        self.entries
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|e| &e.infohash == infohash)
+            .cloned()
+    }
+}
+
+fn decode_hex20(hex: &str) -> Option<[u8; 20]> {
+    if hex.len() != 40 {
+        return None;
+    }
+    let mut out = [0u8; 20];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Env opt-in to allow fetching transport files from non-global (private/LAN/loopback)
+/// hosts. Default off — the SSRF guard stays closed for normal use. Intended for
+/// controlled self-hosted or test swarms on a private network, and mirrors
+/// [`crate::discover::TrackerPolicy`]'s `OUTPACE_TRACKER_ALLOW_NON_GLOBAL`.
+fn allow_non_global_transport() -> bool {
+    allow_non_global_transport_value(
+        std::env::var("OUTPACE_ALLOW_NON_GLOBAL_TRANSPORT")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure parse of the `OUTPACE_ALLOW_NON_GLOBAL_TRANSPORT` value: only `Some("1")` allows;
+/// anything else (including unset, `"0"`, or `"true"`) denies. Mirrors
+/// [`crate::discover::TrackerPolicy::from_env_value`].
+fn allow_non_global_transport_value(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+// Retain the existing inline policy tests without duplicating the shared classifier.
+#[cfg(test)]
+async fn resolve_safe_addr(host: &str, port: u16) -> Result<SocketAddr, ResolveError> {
+    let (_cancel_tx, cancel) = tokio::sync::watch::channel(false);
+    http_fetch::resolve_addr(
+        host,
+        port,
+        FetchPolicy {
+            allow_non_global: allow_non_global_transport(),
+        },
+        cancel,
+    )
+    .await
+    .map_err(transport_fetch_error)
+}
+
+/// Upper bound on a fetched transport-file body (bytes). Matches the descriptor ceilings the
+/// catalog path and `MAX_METADATA_SIZE` already impose on the same `AceStreamTransport` dict.
+pub const MAX_TRANSPORT_FILE: u64 = 1_048_576;
+
+const TRANSPORT_URL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const TRANSPORT_URL_TOTAL_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Retain the existing local transport tests while using the shared connector.
+#[cfg(test)]
+async fn fetch_transport_from(
+    url: &str,
+    _host: &str,
+    addr: SocketAddr,
+) -> Result<StreamInfo, ResolveError> {
+    let parsed = FetchUrl::parse_transport(url).map_err(transport_fetch_error)?;
+    let (_cancel_tx, cancel) = tokio::sync::watch::channel(false);
+    let hooks = http_fetch::test_support::TestHooks::new().with_dns_answers(vec![addr]);
+    let body = http_fetch::test_support::open_with(
+        &parsed,
+        FetchPolicy {
+            allow_non_global: true,
+        },
+        transport_fetch_limits(),
+        cancel,
+        hooks,
+    )
+    .await
+    .map_err(transport_fetch_error)?;
+    let bytes = collect_transport(body).await?;
+    stream_info_from_transport(&bytes)
+}
+
+fn transport_fetch_limits() -> FetchLimits {
+    FetchLimits {
+        connect_timeout: TRANSPORT_URL_CONNECT_TIMEOUT,
+        headers_timeout: TRANSPORT_URL_TOTAL_TIMEOUT,
+        source_response: false,
+    }
+}
+
+fn transport_fetch_error(error: FetchError) -> ResolveError {
+    ResolveError::Url(match error {
+        FetchError::BadUrl | FetchError::InvalidSourceUrl => "bad url",
+        FetchError::UnsupportedScheme => "unsupported scheme",
+        FetchError::NoHost => "no host",
+        FetchError::NoPort => "no port",
+        FetchError::AddressBlocked | FetchError::SourceAddressBlocked => "blocked address",
+        FetchError::DnsFailed | FetchError::DnsTimeout => "dns failed",
+        FetchError::ClientBuildFailed => "client build failed",
+        FetchError::HttpStatus | FetchError::RedirectRejected => "http status",
+        _ => "fetch failed",
+    })
+}
+
+async fn collect_transport(mut response: GuardedBody) -> Result<Vec<u8>, ResolveError> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.next_chunk().await.map_err(transport_fetch_error)? {
+        if body.len() as u64 + chunk.len() as u64 > MAX_TRANSPORT_FILE {
+            return Err(ResolveError::Url("transport too large"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// Resolve a transport-file `url=` input into a [`StreamInfo`]: require an http/https scheme, run
+/// the SSRF guard on the host, then fetch and decode through the shared guarded client.
+/// Every failure path is fail-closed.
+pub async fn stream_info_from_transport_url(url: &str) -> Result<StreamInfo, ResolveError> {
+    stream_info_from_transport(&transport_bytes_from_url(url).await?)
+}
+
+/// Fetch raw `AceStreamTransport` bytes from an `http(s)` transport-file URL, applying the same
+/// SSRF guard and size cap as [`stream_info_from_transport_url`]. The pure decode half is left
+/// to the caller ([`vod_info_from_transport`] for VOD).
+pub async fn transport_bytes_from_url(url: &str) -> Result<Vec<u8>, ResolveError> {
+    let parsed = FetchUrl::parse_transport(url).map_err(transport_fetch_error)?;
+    let policy = FetchPolicy {
+        allow_non_global: allow_non_global_transport(),
+    };
+    let (_cancel_tx, cancel) = tokio::sync::watch::channel(false);
+    // Shared transport mode retains the finite request/body budget after DNS;
+    // source-only status/header/frame restrictions do not apply here.
+    let response = http_fetch::open(&parsed, policy, transport_fetch_limits(), cancel)
+        .await
+        .map_err(transport_fetch_error)?;
+    collect_transport(response).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cbc::cipher::{block_padding::Pkcs7, BlockModeEncrypt, KeyIvInit};
+
+    #[test]
+    fn transport_non_global_env_value_parses_to_deny_unless_exactly_one() {
+        // Pure parse, no env mutation. Mirrors TrackerPolicy::from_env_value (#118): only the
+        // exact value "1" opts in. Note this is stricter than the daemon's general boolean gates
+        // (which also accept "true") -- "true" here denies, matching the sibling tracker knob.
+        assert!(!allow_non_global_transport_value(None));
+        assert!(!allow_non_global_transport_value(Some("0")));
+        assert!(!allow_non_global_transport_value(Some("true")));
+        assert!(!allow_non_global_transport_value(Some("")));
+        assert!(allow_non_global_transport_value(Some("1")));
+    }
+
+    fn vod_transport(pieces_bytes: usize, length: Option<i64>, multifile: bool) -> Vec<u8> {
+        use ace_wire::bencode::Bencode;
+        use std::collections::BTreeMap;
+        let mut d = BTreeMap::new();
+        d.insert(b"name".to_vec(), Bencode::Bytes(b"movie".to_vec()));
+        // Fields the infohash formula requires (name/authmethod/pubkey/piece_length/
+        // chunk_length/bitrate — see infohash_of_descriptor).
+        d.insert(b"authmethod".to_vec(), Bencode::Bytes(b"None".to_vec()));
+        d.insert(b"pubkey".to_vec(), Bencode::Bytes(vec![]));
+        d.insert(b"bitrate".to_vec(), Bencode::Int(100000));
+        d.insert(b"piece_length".to_vec(), Bencode::Int(131072));
+        d.insert(b"chunk_length".to_vec(), Bencode::Int(16384));
+        if let Some(len) = length {
+            d.insert(b"length".to_vec(), Bencode::Int(len));
+        }
+        if pieces_bytes > 0 {
+            d.insert(b"pieces".to_vec(), Bencode::Bytes(vec![7u8; pieces_bytes]));
+        }
+        if multifile {
+            d.insert(b"files".to_vec(), Bencode::List(vec![]));
+        }
+        ace_wire::transport::encode_transport(&Bencode::Dict(d))
+    }
+
+    fn vod_transport_with_provider_selectors() -> Vec<u8> {
+        use ace_wire::bencode::Bencode;
+
+        let transport = vod_transport(60, Some(300000), false);
+        let mut descriptor = ace_wire::transport::decode_transport(&transport)
+            .expect("existing synthetic VOD fixture decodes")
+            .raw;
+        let Bencode::Dict(fields) = &mut descriptor else {
+            unreachable!("decoded transport descriptor is a dictionary");
+        };
+        fields.insert(
+            b"provider_key".to_vec(),
+            Bencode::Bytes(b"synthetic-provider-key".to_vec()),
+        );
+        fields.insert(
+            b"provider_sid".to_vec(),
+            Bencode::Bytes(b"synthetic-provider-session".to_vec()),
+        );
+        ace_wire::transport::encode_transport(&descriptor)
+    }
+
+    fn independent_six_field_hash(descriptor: &ace_wire::bencode::Bencode) -> [u8; 20] {
+        use ace_wire::bencode::Bencode;
+
+        let pairs: Vec<Bencode> = [
+            b"name".as_slice(),
+            b"authmethod".as_slice(),
+            b"pubkey".as_slice(),
+            b"piece_length".as_slice(),
+            b"chunk_length".as_slice(),
+            b"bitrate".as_slice(),
+        ]
+        .iter()
+        .map(|key| {
+            Bencode::List(vec![
+                Bencode::Bytes(key.to_vec()),
+                descriptor
+                    .get(key)
+                    .expect("synthetic VOD has each legacy field")
+                    .clone(),
+            ])
+        })
+        .collect();
+        Sha1::digest(Bencode::List(pairs).encode()).into()
+    }
+
+    fn synthetic_live_transport_with_provider_selectors() -> (Vec<u8>, ace_wire::bencode::Bencode) {
+        use ace_wire::bencode::Bencode;
+
+        let original = include_bytes!("../../../tests/vectors/transport/synthetic-live-512k.bin");
+        let mut descriptor = ace_wire::transport::decode_transport(original)
+            .expect("accepted synthetic live fixture decodes")
+            .raw;
+        let Bencode::Dict(fields) = &mut descriptor else {
+            unreachable!("decoded transport descriptor is a dictionary");
+        };
+        fields.insert(
+            b"provider_key".to_vec(),
+            Bencode::Bytes(b"synthetic-provider-key".to_vec()),
+        );
+        fields.insert(
+            b"provider_sid".to_vec(),
+            Bencode::Bytes(b"synthetic-provider-session".to_vec()),
+        );
+        let wrapped = ace_wire::transport::encode_transport(&descriptor);
+        (wrapped, descriptor)
+    }
+
+    fn independent_live_selector_hash(descriptor: &ace_wire::bencode::Bencode) -> [u8; 20] {
+        use ace_wire::bencode::Bencode;
+
+        let pairs: Vec<Bencode> = [
+            b"name".as_slice(),
+            b"authmethod".as_slice(),
+            b"pubkey".as_slice(),
+            b"piece_length".as_slice(),
+            b"chunk_length".as_slice(),
+            b"bitrate".as_slice(),
+            b"premium".as_slice(),
+            b"commerce".as_slice(),
+            b"provider_key".as_slice(),
+            b"provider_sid".as_slice(),
+            b"access".as_slice(),
+            b"sharing".as_slice(),
+            b"private".as_slice(),
+            b"tns".as_slice(),
+            b"license".as_slice(),
+        ]
+        .iter()
+        .filter_map(|key| {
+            descriptor
+                .get(key)
+                .map(|value| Bencode::List(vec![Bencode::Bytes(key.to_vec()), value.clone()]))
+        })
+        .collect();
+        Sha1::digest(Bencode::List(pairs).encode()).into()
+    }
+
+    #[test]
+    fn vod_info_from_single_file_transport() {
+        let tf = vod_transport(60, Some(300000), false); // 3 pieces, single-file
+        let info = vod_info_from_transport(&tf).unwrap();
+        assert_eq!(info.piece_hashes.len(), 3);
+        assert_eq!(info.total_length, 300000);
+        assert_eq!(info.piece_size(2), 300000 - 2 * 131072);
+    }
+
+    #[test]
+    fn wrapped_vod_resolution_keeps_legacy_hash_with_provider_selectors() {
+        let transport = vod_transport_with_provider_selectors();
+        let decoded = ace_wire::transport::decode_transport(&transport).unwrap();
+        assert!(
+            !decoded.is_live,
+            "synthetic descriptor must take the VOD path"
+        );
+        assert_eq!(
+            decoded.pieces.len(),
+            3,
+            "synthetic VOD has valid piece hashes"
+        );
+
+        let expected = independent_six_field_hash(&decoded.raw);
+        assert_eq!(
+            vod_info_from_transport(&transport).unwrap().infohash,
+            expected,
+            "VOD resolver must preserve the legacy six-field identity"
+        );
+    }
+
+    #[test]
+    fn live_stream_info_matches_raw_and_wrapped_fifteen_field_identity() {
+        let (transport, descriptor) = synthetic_live_transport_with_provider_selectors();
+        let decoded = ace_wire::transport::decode_transport(&transport).unwrap();
+        assert!(
+            decoded.is_live,
+            "synthetic descriptor must take the live path"
+        );
+
+        let expected = independent_live_selector_hash(&descriptor);
+        assert_eq!(
+            ace_wire::infohash::infohash_of_descriptor(&decoded.raw).unwrap(),
+            expected,
+            "raw live descriptor uses the extended selector"
+        );
+        assert_eq!(
+            ace_wire::infohash::try_infohash_of_transport(&transport).unwrap(),
+            expected,
+            "wrapped live wire entrypoint uses the extended selector"
+        );
+        assert_eq!(
+            stream_info_from_transport(&transport).unwrap().infohash,
+            expected,
+            "StreamInfo uses the same decoded live identity"
+        );
+    }
+
+    #[test]
+    fn stream_info_accepts_optional_bearing_wrapped_vod_with_legacy_identity() {
+        let transport = vod_transport_with_provider_selectors();
+        let decoded = ace_wire::transport::decode_transport(&transport).unwrap();
+        assert!(
+            !decoded.is_live,
+            "synthetic descriptor must classify as VOD"
+        );
+        let expected = independent_six_field_hash(&decoded.raw);
+
+        let info = stream_info_from_transport(&transport)
+            .expect("StreamInfo path continues to accept the legacy wrapped VOD descriptor");
+        assert_eq!(info.infohash, expected);
+        assert_eq!(info.piece_length, decoded.piece_length);
+        assert_eq!(info.chunk_length, decoded.chunk_length);
+    }
+
+    #[test]
+    fn optional_bearing_live_stream_info_keeps_geometry_key_and_index_binding() {
+        let (base_transport, pubkey) = synthetic_512k_transport();
+        let mut descriptor = ace_wire::transport::decode_transport(&base_transport)
+            .expect("synthetic 512 KiB live fixture decodes")
+            .raw;
+        let ace_wire::bencode::Bencode::Dict(fields) = &mut descriptor else {
+            unreachable!("decoded transport descriptor is a dictionary");
+        };
+        fields.insert(
+            b"provider_key".to_vec(),
+            ace_wire::bencode::Bencode::Bytes(b"synthetic-provider-key".to_vec()),
+        );
+        fields.insert(
+            b"provider_sid".to_vec(),
+            ace_wire::bencode::Bencode::Bytes(b"synthetic-provider-session".to_vec()),
+        );
+        let transport = ace_wire::transport::encode_transport(&descriptor);
+        let decoded = ace_wire::transport::decode_transport(&transport).unwrap();
+        assert!(
+            decoded.is_live,
+            "synthetic descriptor must classify as live"
+        );
+
+        let expected = independent_live_selector_hash(&descriptor);
+        let previous_six_field = independent_six_field_hash(&descriptor);
+        assert_ne!(expected, previous_six_field);
+
+        let info = stream_info_from_transport(&transport).unwrap();
+        assert_eq!(info.infohash, expected);
+        assert_eq!(info.piece_length, 524_288);
+        assert_eq!(info.chunk_length, 16_384);
+        assert_eq!(info.chunks_per_piece(), 32);
+        assert_eq!(info.sig_len, 96);
+        assert_eq!(info.source_pubkey, pubkey);
+
+        let index = InfohashIndex::new(2);
+        index.put(info.clone());
+        assert_eq!(index.get(&expected), Some(info));
+        assert!(index.get(&previous_six_field).is_none());
+    }
+
+    #[test]
+    fn vod_info_rejects_live_transport() {
+        let tf = vod_transport(0, None, false); // no pieces => live
+        assert!(matches!(
+            vod_info_from_transport(&tf),
+            Err(ResolveError::Transport(_))
+        ));
+    }
+
+    #[test]
+    fn vod_info_rejects_multifile() {
+        let tf = vod_transport(20, Some(1000), true);
+        assert!(matches!(
+            vod_info_from_transport(&tf),
+            Err(ResolveError::Transport(_))
+        ));
+    }
+
+    #[test]
+    fn vod_info_rejects_missing_length() {
+        let tf = vod_transport(20, None, false);
+        assert!(matches!(
+            vod_info_from_transport(&tf),
+            Err(ResolveError::Transport(_))
+        ));
+    }
+
+    #[test]
+    fn infohash_hex_is_lowercase_and_zero_padded() {
+        let infohash = [
+            0x00, 0x01, 0x0a, 0x0f, 0x10, 0xab, 0xcd, 0xef, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70,
+            0x80, 0x90, 0xa0, 0xb0, 0xc0, 0xd0,
+        ];
+        let encoded = infohash_hex(&infohash);
+
+        assert_eq!(encoded, "00010a0f10abcdef2030405060708090a0b0c0d0");
+        assert_eq!(hex20(&encoded).unwrap(), infohash);
+    }
+
+    #[test]
+    fn ssrf_guard_rejects_unsafe_ip_literals() {
+        use std::net::Ipv4Addr;
+        for ip in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "192.168.0.1",
+            "172.16.0.1",
+            "169.254.0.1",
+            "100.64.0.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "224.0.0.1",
+        ] {
+            assert!(!is_safe_ip(&ip.parse().unwrap()), "{ip} must be unsafe");
+        }
+        for ip in ["::1", "fc00::1", "fe80::1", "::", "ff02::1"] {
+            assert!(!is_safe_ip(&ip.parse().unwrap()), "{ip} must be unsafe");
+        }
+        // IPv4-mapped loopback must also be rejected.
+        assert!(!is_safe_ip(&"::ffff:127.0.0.1".parse().unwrap()));
+        // Public addresses are allowed.
+        assert!(is_safe_ip(&IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))));
+        assert!(is_safe_ip(&IpAddr::V6(
+            "2606:2800:220:1:248:1893:25c8:1946".parse().unwrap()
+        )));
+    }
+
+    #[test]
+    fn non_global_transport_optin_stays_narrow() {
+        // The opt-in path ANDs `is_private_or_loopback`, so these extra targets must be
+        // unblocked by it (private/LAN/loopback + CGNAT)...
+        for ip in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "192.168.0.1",
+            "172.16.0.1",
+            "172.28.0.1", // the interop harness's bridge gateway
+            "100.64.0.1",
+        ] {
+            assert!(
+                is_private_or_loopback(&ip.parse().unwrap()),
+                "{ip} must be reachable under the opt-in"
+            );
+        }
+        for ip in ["::1", "fc00::1", "::ffff:127.0.0.1"] {
+            assert!(
+                is_private_or_loopback(&ip.parse().unwrap()),
+                "{ip} must be reachable under the opt-in"
+            );
+        }
+        // ...but link-local (incl. the cloud metadata endpoint), unspecified, broadcast,
+        // and multicast stay blocked even with the opt-in on.
+        for ip in [
+            "169.254.169.254",
+            "169.254.0.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "224.0.0.1",
+        ] {
+            assert!(
+                !is_private_or_loopback(&ip.parse().unwrap()),
+                "{ip} must stay blocked even under the opt-in"
+            );
+        }
+        for ip in ["fe80::1", "::", "ff02::1"] {
+            assert!(
+                !is_private_or_loopback(&ip.parse().unwrap()),
+                "{ip} must stay blocked even under the opt-in"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ssrf_guard_rejects_loopback_host() {
+        assert_eq!(
+            resolve_safe_addr("127.0.0.1", 80).await,
+            Err(ResolveError::Url("blocked address"))
+        );
+    }
+
+    #[tokio::test]
+    async fn ssrf_guard_handles_bracketed_ipv6_literal() {
+        // `Url::host_str` returns IPv6 literals bracketed; they must be parsed+validated, not
+        // treated as an (always-failing) hostname. Bracketed loopback -> blocked (not dns failed).
+        assert_eq!(
+            resolve_safe_addr("[::1]", 80).await,
+            Err(ResolveError::Url("blocked address"))
+        );
+        // A bracketed public IPv6 literal resolves to a safe address.
+        let ok = resolve_safe_addr("[2606:2800:220:1:248:1893:25c8:1946]", 443)
+            .await
+            .unwrap();
+        assert_eq!(ok.port(), 443);
+        assert!(ok.is_ipv6());
+    }
+
+    // Minimal one-shot HTTP/1.1 server: serves `status`+`body` to the first connection.
+    async fn serve_once(status: &'static str, body: Vec<u8>) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await; // drain request headers
+                let header = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(header.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn fetch_decodes_a_valid_transport() {
+        let tf = make_transport(
+            b"d10:authmethod3:RSA7:bitratei100000e12:chunk_lengthi16384e4:name4:Test12:piece_lengthi1048576e6:pubkey3:abc8:trackersl18:udp://t.example:80ee",
+        );
+        let addr = serve_once("200 OK", tf).await;
+        let url = format!("http://127.0.0.1:{}/t.bin", addr.port());
+        let si = fetch_transport_from(&url, "127.0.0.1", addr).await.unwrap();
+        assert_eq!(si.piece_length, 1_048_576);
+        assert_eq!(si.infohash[0], 0x92);
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_oversized_body() {
+        let addr = serve_once("200 OK", vec![b'x'; (MAX_TRANSPORT_FILE + 1) as usize]).await;
+        let url = format!("http://127.0.0.1:{}/big.bin", addr.port());
+        assert_eq!(
+            fetch_transport_from(&url, "127.0.0.1", addr).await,
+            Err(ResolveError::Url("transport too large"))
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_non_transport_body() {
+        let addr = serve_once("200 OK", b"not a transport".to_vec()).await;
+        let url = format!("http://127.0.0.1:{}/x", addr.port());
+        assert!(matches!(
+            fetch_transport_from(&url, "127.0.0.1", addr).await,
+            Err(ResolveError::Transport(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_non_200_status() {
+        let addr = serve_once("404 Not Found", b"nope".to_vec()).await;
+        let url = format!("http://127.0.0.1:{}/missing", addr.port());
+        assert_eq!(
+            fetch_transport_from(&url, "127.0.0.1", addr).await,
+            Err(ResolveError::Url("http status"))
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_url_rejects_unsupported_scheme() {
+        assert_eq!(
+            stream_info_from_transport_url("file:///etc/passwd").await,
+            Err(ResolveError::Url("unsupported scheme"))
+        );
+        assert_eq!(
+            stream_info_from_transport_url("ftp://example.com/x").await,
+            Err(ResolveError::Url("unsupported scheme"))
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "network: fetches a real public transport-file URL"]
+    async fn live_transport_url_fetch() {
+        // Replace with a known public/free transport-file URL when validating live.
+        let url =
+            std::env::var("OUTPACE_TEST_TRANSPORT_URL").expect("set OUTPACE_TEST_TRANSPORT_URL");
+        let si = stream_info_from_transport_url(&url).await.unwrap();
+        assert_ne!(si.infohash, [0u8; 20]);
+    }
+
+    // Wrap raw bencode into a transport file under the global key/IV (mirrors transport.rs).
+    fn make_transport(plaintext: &[u8]) -> Vec<u8> {
+        type Enc = cbc::Encryptor<aes::Aes128>;
+        let body = Enc::new_from_slices(
+            &ace_wire::transport::TRANSPORT_KEY,
+            &ace_wire::transport::TRANSPORT_IV,
+        )
+        .unwrap()
+        .encrypt_padded_vec::<Pkcs7>(plaintext);
+        let mut out = b"AceStreamTransport\x00\x02".to_vec();
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn transport_yields_stream_info() {
+        let tf = make_transport(
+            b"d10:authmethod3:RSA7:bitratei100000e12:chunk_lengthi16384e4:name4:Test12:piece_lengthi1048576e6:pubkey3:abc8:trackersl18:udp://t.example:80ee",
+        );
+        let si = stream_info_from_transport(&tf).unwrap();
+        assert_eq!(si.piece_length, 1_048_576);
+        assert_eq!(si.chunk_length, 16_384);
+        assert_eq!(si.chunks_per_piece(), 64);
+        assert_eq!(si.trackers, vec!["udp://t.example:80".to_string()]);
+        assert_eq!(si.metadata.title.as_deref(), Some("Test"));
+        assert_eq!(si.metadata.bitrate, Some(100_000));
+        assert!(si.metadata.categories.is_empty());
+        assert_eq!(
+            si.infohash,
+            [
+                0x92, 0x6e, 0x81, 0x18, 0x33, 0x4d, 0xfa, 0x31, 0xa4, 0x5d, 0x5b, 0xd9, 0x02, 0x30,
+                0x6d, 0x42, 0xae, 0xa7, 0xf8, 0x8c,
+            ]
+        );
+    }
+
+    #[test]
+    fn transport_preserves_categories_in_stream_metadata() {
+        let tf = make_transport(
+            b"d10:authmethod3:RSA7:bitratei100000e10:categoriesl6:sports4:livee12:chunk_lengthi16384e4:name4:Test12:piece_lengthi1048576e6:pubkey3:abce",
+        );
+        let si = stream_info_from_transport(&tf).unwrap();
+
+        assert_eq!(si.metadata.categories, vec!["sports", "live"]);
+    }
+
+    #[test]
+    fn rejects_oversized_piece_length() {
+        // 100 MiB pieces would force a huge per-piece reassembly buffer at stream start;
+        // reject the untrusted geometry before it becomes a StreamInfo.
+        let tf = make_transport(b"d12:chunk_lengthi16384e12:piece_lengthi104857600ee");
+        assert_eq!(
+            stream_info_from_transport(&tf),
+            Err(ResolveError::Transport("piece_length too large"))
+        );
+    }
+
+    #[test]
+    fn rejects_unexpected_chunk_length() {
+        // The wire codec's chunk size is the fixed Acestream protocol constant (16 KiB).
+        let tf = make_transport(b"d12:chunk_lengthi8192e12:piece_lengthi65536ee");
+        assert_eq!(
+            stream_info_from_transport(&tf),
+            Err(ResolveError::Transport("unexpected chunk_length"))
+        );
+    }
+
+    #[test]
+    fn rejects_piece_length_not_multiple_of_chunk() {
+        // A piece that isn't a whole number of chunks makes chunk request generation
+        // inconsistent with the descriptor.
+        let tf = make_transport(b"d12:chunk_lengthi16384e12:piece_lengthi65537ee");
+        assert_eq!(
+            stream_info_from_transport(&tf),
+            Err(ResolveError::Transport(
+                "piece_length not a multiple of chunk_length"
+            ))
+        );
+    }
+
+    #[test]
+    fn accepts_broadcast_geometry() {
+        // 64 KiB pieces / 16 KiB chunks — the source-node geometry outpace itself mints.
+        let tf = make_transport(
+            b"d10:authmethod3:RSA7:bitratei8375e12:chunk_lengthi16384e4:name4:Test12:piece_lengthi65536e6:pubkey3:abce",
+        );
+        let si = stream_info_from_transport(&tf).unwrap();
+        assert_eq!(si.piece_length, 65_536);
+        assert_eq!(si.chunk_length, 16_384);
+        assert_eq!(si.chunks_per_piece(), 4);
+    }
+
+    #[test]
+    fn bad_infohash_rejected() {
+        assert_eq!(hex20("xyz"), Err(ResolveError::BadInfohash));
+        assert_eq!(hex20(&"z".repeat(40)), Err(ResolveError::BadInfohash));
+    }
+
+    #[test]
+    fn catalog_signature_matches_engine_vectors() {
+        let cid = "2123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            catalog_signature(cid, 4_245_094_384_320_117_676),
+            "ee6c8422795ced4cd5c1fb80f10276801ab636c6"
+        );
+        assert_eq!(
+            catalog_signature(cid, 2_142_790_664_659_308_268),
+            "08c4ba548457e883f8711d3f3cb846c20058d912"
+        );
+        assert_eq!(
+            catalog_signature(cid, 3_472_462_845_767_567_311),
+            "c7c3cd3c7268be1a48144653cdbd7912991cb337"
+        );
+    }
+
+    #[test]
+    fn catalog_response_rejects_substitution_even_with_updated_checksum() {
+        let body = include_bytes!("../../../tests/vectors/catalog/substituted.xml");
+        assert!(catalog_response_transport(body, 123).is_err());
+    }
+
+    #[test]
+    fn catalog_response_rejects_missing_or_invalid_signature() {
+        let body = include_str!("../../../tests/vectors/catalog/response.xml");
+        let sig_start = body.find(" sig=\"").unwrap();
+        let sig_end = sig_start + " sig=\"".len() + 40 + 1;
+        let mut unsigned = body.to_string();
+        unsigned.replace_range(sig_start..sig_end, "");
+        assert!(catalog_response_transport(unsigned.as_bytes(), 123).is_err());
+        let mut invalid = body.to_string();
+        invalid.replace_range(sig_start + 6..sig_end - 1, &"0".repeat(40));
+        assert!(catalog_response_transport(invalid.as_bytes(), 123).is_err());
+    }
+
+    #[test]
+    fn catalog_response_accepts_engine_verified_synthetic_descriptor() {
+        let body = include_bytes!("../../../tests/vectors/catalog/response.xml");
+        let transport = catalog_response_transport(body, 123).unwrap();
+        let info = stream_info_from_transport(&transport).unwrap();
+        assert_eq!(info.piece_length, 65_536);
+        assert_eq!(info.trackers, ["http://tracker.example.invalid/announce"]);
+    }
+
+    #[test]
+    fn catalog_response_rejects_replay_for_a_different_request() {
+        let body = include_bytes!("../../../tests/vectors/catalog/response.xml");
+        assert_eq!(
+            catalog_response_transport(body, 124),
+            Err(ResolveError::Catalog("catalog random mismatch"))
+        );
+    }
+
+    fn signed_catalog_response(unsigned: &str) -> String {
+        let mut hasher = Sha1::new();
+        hasher.update(unsigned.as_bytes());
+        hasher.update(CATALOG_RESPONSE_KEY);
+        let signature = hex::encode(hasher.finalize());
+        unsigned.replacen("<response", &format!("<response sig=\"{signature}\""), 1)
+    }
+
+    #[test]
+    fn catalog_infohash_rejects_authenticated_descriptor_for_another_swarm() {
+        let body = include_bytes!("../../../tests/vectors/catalog/response.xml");
+        let bytes = catalog_response_transport(body, 123).unwrap();
+        let expected = stream_info_from_transport(&bytes).unwrap();
+        assert_eq!(
+            catalog_infohash_info(&bytes, expected.infohash).unwrap(),
+            expected
+        );
+        assert_eq!(
+            catalog_infohash_info(&bytes, [0; 20]),
+            Err(ResolveError::Catalog("catalog infohash mismatch"))
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_infohash_query_encodes_base64_but_signs_raw_value() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            socket.shutdown().await.unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let value = Base64::encode_string(&[0xfb; 20]);
+        let _ = fetch_catalog_transport_query("127.0.0.1", port, "infohash", &value).await;
+        let request = server.await.unwrap();
+        let path = request.split_whitespace().nth(1).unwrap();
+        let url = reqwest::Url::parse(&format!("http://catalog.example.invalid{path}")).unwrap();
+        let params: HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(params.get("infohash"), Some(&value));
+        assert!(!params.contains_key("pid"));
+        for escape in ["%2B", "%2F", "%3D"] {
+            assert!(path.contains(escape), "missing Base64 URL escape {escape}");
+        }
+        let signed = format!(
+            "_n=3.2.11#_p=linux#_r={}#_v=3021100#infohash={value}",
+            params["_r"]
+        );
+        let mut hasher = Sha1::new();
+        hasher.update(signed.as_bytes());
+        hasher.update(CATALOG_SIGNING_SECRET);
+        assert_eq!(params["_s"], hex::encode(hasher.finalize()));
+    }
+
+    #[test]
+    fn catalog_response_still_requires_checksum_after_authentication() {
+        let body = signed_catalog_response(
+            "<response r=\"123\"><torrent>YWJj</torrent><checksum>0000000000000000000000000000000000000000</checksum></response>",
+        );
+        assert_eq!(
+            catalog_response_transport(body.as_bytes(), 123),
+            Err(ResolveError::Catalog("checksum mismatch"))
+        );
+    }
+
+    #[test]
+    fn catalog_response_rejects_malformed_or_ambiguous_xml() {
+        for unsigned in [
+            "<wrapper><response r=\"123\"/></wrapper>",
+            "<response r=\"123\"/><response r=\"123\"/>",
+            "<response r=\"123\" r=\"124\"/>",
+            "<response sig=\"abc\" r=\"123\"/>",
+            "<!DOCTYPE response [<!ENTITY nonce '123'>]><response r=\"&nonce;\"/>",
+            "<response/>",
+            "<response r=\"not-a-number\"/>",
+            "<response r=\"123\"><wrapper><torrent>YWJj</torrent></wrapper></response>",
+            "<response r=\"123\"><torrent>YWJj</torrent><torrent>ZGVm</torrent></response>",
+            "<response r=\"123\"><torrent><nested/></torrent></response>",
+        ] {
+            let body = signed_catalog_response(unsigned);
+            assert!(
+                catalog_response_transport(body.as_bytes(), 123).is_err(),
+                "{unsigned}"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_response_authenticates_original_bytes_and_bounds_input() {
+        let body = include_str!("../../../tests/vectors/catalog/response.xml");
+        // XML-equivalent whitespace changes must invalidate a signature over the raw text.
+        let modified = body.replace("</torrent>", "</torrent>\n");
+        assert_eq!(
+            catalog_response_transport(modified.as_bytes(), 123),
+            Err(ResolveError::Catalog("catalog signature mismatch"))
+        );
+        assert!(catalog_response_transport(&[0xff], 123).is_err());
+        assert!(catalog_response_transport(&vec![b' '; CATALOG_RESPONSE_LIMIT + 1], 123).is_err());
+    }
+
+    #[tokio::test]
+    async fn catalog_http_fetch_binds_response_to_its_generated_nonce() {
+        use tokio::net::TcpListener;
+
+        for replay in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(socket.read_u8().await.unwrap());
+                }
+                let request = String::from_utf8(request).unwrap();
+                let random: u64 = request
+                    .split("_r=")
+                    .nth(1)
+                    .unwrap()
+                    .split('&')
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let response_random = if replay { random + 1 } else { random };
+                let body = signed_catalog_response(&format!(
+                    "<response r=\"{response_random}\"><torrent>YWJj</torrent><checksum>a9993e364706816aba3e25717850c26c9cd0d89d</checksum></response>",
+                ));
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            });
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                fetch_catalog_transport(
+                    "127.0.0.1",
+                    port,
+                    "0123456789abcdef0123456789abcdef01234567",
+                ),
+            )
+            .await
+            .unwrap();
+            server.await.unwrap();
+            if replay {
+                assert_eq!(
+                    result,
+                    Err(ResolveError::Catalog("catalog random mismatch"))
+                );
+            } else {
+                assert_eq!(result.unwrap(), b"abc");
+            }
+        }
+    }
+
+    #[test]
+    fn http_response_body_decodes_chunked_catalog_response() {
+        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n4\r\ndefg\r\n0\r\n\r\n";
+        assert_eq!(http_response_body(response).unwrap(), b"abcdefg");
+    }
+
+    #[test]
+    fn metadata_size_accepts_plausible_values() {
+        assert_eq!(checked_metadata_size(1), Ok(1));
+        assert_eq!(checked_metadata_size(4096), Ok(4096));
+        assert_eq!(
+            checked_metadata_size(MAX_METADATA_SIZE as i64),
+            Ok(MAX_METADATA_SIZE)
+        );
+    }
+
+    #[test]
+    fn metadata_size_rejects_non_positive() {
+        assert_eq!(
+            checked_metadata_size(0),
+            Err(ResolveError::Peer("invalid ut_metadata params"))
+        );
+        assert_eq!(
+            checked_metadata_size(-1),
+            Err(ResolveError::Peer("invalid ut_metadata params"))
+        );
+    }
+
+    #[test]
+    fn metadata_size_rejects_oversize() {
+        // A hostile peer advertising a huge metadata_size would force a large BEP-9 request
+        // fan-out and a `vec![0u8; metadata_size]` allocation before any descriptor is decoded.
+        assert_eq!(
+            checked_metadata_size(MAX_METADATA_SIZE as i64 + 1),
+            Err(ResolveError::Peer("invalid ut_metadata params"))
+        );
+        assert_eq!(
+            checked_metadata_size(i64::MAX),
+            Err(ResolveError::Peer("invalid ut_metadata params"))
+        );
+    }
+
+    #[test]
+    fn cache_returns_stored_value_then_expires() {
+        let c = ResolveCache::new(Duration::from_millis(40));
+        let info = StreamInfo {
+            infohash: [7; 20],
+            piece_length: 1,
+            chunk_length: 1,
+            trackers: vec![],
+            metadata: StreamMetadata::default(),
+            sig_len: 0,
+            source_pubkey: vec![],
+        };
+        assert_eq!(c.get("k"), None);
+        c.put("k", info.clone());
+        assert_eq!(c.get("k"), Some(info));
+        std::thread::sleep(Duration::from_millis(55));
+        assert_eq!(c.get("k"), None, "entry expires after the TTL");
+    }
+
+    fn indexed_info(infohash: [u8; 20], piece_length: u64) -> StreamInfo {
+        StreamInfo {
+            infohash,
+            piece_length,
+            chunk_length: 16_384,
+            trackers: vec![],
+            metadata: StreamMetadata::default(),
+            sig_len: 0,
+            source_pubkey: vec![],
+        }
+    }
+
+    #[test]
+    fn infohash_index_returns_only_the_entry_for_that_infohash() {
+        let index = InfohashIndex::new(4);
+        assert_eq!(index.get(&[1; 20]), None);
+        index.put(indexed_info([1; 20], 524_288));
+        index.put(indexed_info([2; 20], 65_536));
+        assert_eq!(index.get(&[1; 20]).unwrap().piece_length, 524_288);
+        assert_eq!(index.get(&[2; 20]).unwrap().piece_length, 65_536);
+        assert_eq!(index.get(&[3; 20]), None);
+    }
+
+    #[test]
+    fn infohash_index_replaces_an_entry_and_evicts_the_oldest_when_full() {
+        let index = InfohashIndex::new(2);
+        index.put(indexed_info([1; 20], 1));
+        index.put(indexed_info([2; 20], 2));
+        // Re-storing [1] replaces it in place and makes it the newest entry.
+        index.put(indexed_info([1; 20], 10));
+        index.put(indexed_info([3; 20], 3));
+        assert_eq!(index.get(&[2; 20]), None, "the oldest entry is evicted");
+        assert_eq!(index.get(&[1; 20]).unwrap().piece_length, 10);
+        assert_eq!(index.get(&[3; 20]).unwrap().piece_length, 3);
+    }
+
+    /// A synthetic live transport with 512 KiB pieces and a freshly generated RSA source key,
+    /// built with outpace's own encoder (#164). Nothing here comes from a real stream.
+    fn synthetic_512k_transport() -> (Vec<u8>, Vec<u8>) {
+        use ace_wire::bencode::Bencode;
+        let pubkey = ace_wire::live_auth::LiveSourceAuth::generate().pubkey_der();
+        let mut d = std::collections::BTreeMap::new();
+        d.insert(b"name".to_vec(), Bencode::Bytes(b"Synthetic Live".to_vec()));
+        d.insert(b"piece_length".to_vec(), Bencode::Int(524_288));
+        d.insert(b"chunk_length".to_vec(), Bencode::Int(16_384));
+        d.insert(b"bitrate".to_vec(), Bencode::Int(1_000_000));
+        d.insert(b"authmethod".to_vec(), Bencode::Bytes(b"RSA".to_vec()));
+        d.insert(b"pubkey".to_vec(), Bencode::Bytes(pubkey.clone()));
+        d.insert(
+            b"trackers".to_vec(),
+            Bencode::List(vec![Bencode::Bytes(b"udp://tracker.invalid:80".to_vec())]),
+        );
+        (
+            ace_wire::transport::encode_transport(&Bencode::Dict(d)),
+            pubkey,
+        )
+    }
+
+    #[test]
+    fn synthetic_512k_descriptor_keeps_geometry_and_pubkey_through_the_index() {
+        let (transport, pubkey) = synthetic_512k_transport();
+        let info = stream_info_from_transport(&transport).unwrap();
+        // The infohash is computed at test time, never written down.
+        assert_eq!(
+            info.infohash,
+            ace_wire::infohash::infohash_of_transport(&transport)
+        );
+        assert_eq!(info.piece_length, 524_288);
+        assert_eq!(info.chunk_length, 16_384);
+        assert_eq!(info.chunks_per_piece(), 32);
+        assert_eq!(
+            info.sig_len, 96,
+            "768-bit source key => 96-byte signature tail"
+        );
+        assert_eq!(info.source_pubkey, pubkey);
+
+        let index = InfohashIndex::new(8);
+        index.put(info.clone());
+        assert_eq!(index.get(&info.infohash), Some(info));
+    }
+}

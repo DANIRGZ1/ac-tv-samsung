@@ -1,0 +1,2309 @@
+//! Shared outpace runtime setup for the daemon and CLI commands.
+
+use crate::ace_provider::AceProvider;
+use crate::broadcast::{preflight_broadcasts, Broadcast, BroadcastError, BroadcastRegistry};
+use crate::broadcast_options::{
+    parse_broadcast_options, validate_broadcast_options, BroadcastOptionsError,
+};
+use crate::broadcast_pull::{
+    parse_non_global_source_opt_in, parse_source_configs, validate_source_map,
+    ValidatedSourceConfig,
+};
+use crate::config::{load_or_create_identity, safe_in_memory_pool_limit, CacheType, Config};
+use crate::http::{router, AppState, BroadcastState};
+use crate::manager::StreamManager;
+use crate::provider::ProviderRegistry;
+use ace_swarm::http_fetch::FetchPolicy;
+use std::collections::BTreeMap;
+use std::net::{IpAddr, SocketAddr, SocketAddrV4};
+use std::sync::Arc;
+
+/// Default tracker for minted broadcasts (B1) — the same public UDP tracker `AceProvider`
+/// uses for content-id discovery and as its fallback where a descriptor has none. A freshly minted broadcast
+/// self-announces to this tracker *and* DHT (`ace_provider::announce_infohash_periodically`,
+/// spawned from `http.rs`'s ingest handler) as soon as it's minted, independent of whether
+/// anything is locally following it — a pure origin needs to be discoverable too.
+const DEFAULT_BROADCAST_TRACKERS: &[&str] = &["udp://t1.torrentstream.org:2710/announce"];
+
+/// How often the daemon logs its public-reachability status (issue #22). Slow-changing signal,
+/// so a couple of minutes keeps the noise low (cf. the 4-min seeder self-announce cadence).
+const REACHABILITY_STATUS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BroadcastIngestUrls {
+    pub raw: String,
+    pub rtmp: String,
+}
+
+pub struct EngineRuntime {
+    pub config: Config,
+    pub networks: Vec<String>,
+    pub manager: Arc<StreamManager>,
+    pub seed_registry: ace_swarm::listen::SeedRegistry,
+    pub broadcasts: BroadcastState,
+    /// Daemon-wide public-reachability observability (issue #22). `Some` only when inbound
+    /// serving is enabled — with inbound off we can't be dialed, so harvesting/counting is
+    /// entirely absent and the status logger never runs.
+    pub reachability: Option<Arc<ace_swarm::reachability::ReachabilityMonitor>>,
+    announce_port_tx: tokio::sync::watch::Sender<Option<u16>>,
+    identity: Arc<ace_wire::identity::Identity>,
+    source_configs: BTreeMap<String, ValidatedSourceConfig>,
+}
+
+pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
+    let defaults = Config::default();
+    let mut config = Config {
+        allow_non_global_broadcast_source: parse_non_global_source_opt_in(
+            std::env::var("OUTPACE_ALLOW_NON_GLOBAL_BROADCAST_SOURCE")
+                .ok()
+                .as_deref(),
+        ),
+        ..defaults
+    };
+    apply_broadcast_options_env(&mut config, std::env::var("OUTPACE_BROADCAST_OPTIONS"))?;
+    let raw_sources = match std::env::var("OUTPACE_BROADCAST_SOURCES") {
+        Ok(raw) => Some(raw),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => return Err("invalid_source_config".into()),
+    };
+    config.broadcast_sources = parse_source_configs(raw_sources.as_deref())?;
+    validate_source_map(
+        &config.broadcast_sources,
+        FetchPolicy {
+            allow_non_global: config.allow_non_global_broadcast_source,
+        },
+    )?;
+    if let Ok(bind) = std::env::var("OUTPACE_BIND") {
+        config.bind = bind.parse()?;
+    }
+    if let Ok(bind) = std::env::var("OUTPACE_RTMP_BIND") {
+        config.rtmp_bind = bind.parse()?;
+    }
+    if let Ok(dir) = std::env::var("OUTPACE_DATA_DIR") {
+        config.data_dir = dir.into();
+    }
+    if let Some(v) = std::env::var_os("OUTPACE_MAX_SESSIONS") {
+        config.max_sessions = v
+            .to_str()
+            .ok_or("invalid OUTPACE_MAX_SESSIONS")?
+            .parse()
+            .map_err(|_| "invalid OUTPACE_MAX_SESSIONS: expected nonnegative integer")?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_PEER_LISTEN") {
+        config.peer_listen = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_SEED_STORE_BYTES") {
+        config.seed_store_bytes = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_SEED_RETENTION_SECS") {
+        config.seed_retention_secs = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_CACHE_TYPE") {
+        config.cache_type = match v.as_str() {
+            "memory" => CacheType::Memory,
+            "disk" => CacheType::Disk,
+            other => return Err(format!("invalid OUTPACE_CACHE_TYPE: {other}").into()),
+        };
+    }
+    if let Ok(v) = std::env::var("OUTPACE_CACHE_DIR") {
+        config.cache_dir = v.into();
+    }
+    if let Ok(v) = std::env::var("OUTPACE_PREFETCH_PIECES") {
+        config.prefetch_pieces = Some(v.parse()?);
+    }
+    if let Ok(v) = std::env::var("OUTPACE_PREBUFFER_MS") {
+        config.startup_buffer.target_ms = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_PREBUFFER_BYTES") {
+        config.startup_buffer.max_bytes = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_PREBUFFER_TIMEOUT_MS") {
+        config.startup_buffer.timeout_ms = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_SESSION_BUFFER") {
+        let n: usize = v.parse()?;
+        if n == 0 {
+            return Err("OUTPACE_SESSION_BUFFER must be >= 1".into());
+        }
+        config.session_buffer = n;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_REQUEST_TIMEOUT_MS") {
+        config.live_recovery.request_timeout_ms = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_STALE_UPSTREAM_TIMEOUT_MS") {
+        config.live_recovery.stale_upstream_timeout_ms = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_REQUEST_CHECK_INTERVAL_MS") {
+        config.live_recovery.request_check_interval_ms = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_MAX_ACTIVE_UPSTREAMS") {
+        config.live_recovery.max_active_upstreams = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_MAX_PARALLEL_CONNECT") {
+        config.live_recovery.max_parallel_connect = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_MAX_PIECE_ADVANCE") {
+        config.live_recovery.max_piece_advance = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_MAX_REASM_PIECES_AHEAD") {
+        config.live_recovery.max_reasm_pieces_ahead = v.parse()?;
+    }
+    if let Some(v) = bool_from_env("OUTPACE_HLS_AUDIO_NORMALIZE")? {
+        config.hls_audio.normalize = v;
+    }
+    if let Some(v) = std::env::var_os("OUTPACE_FFMPEG_PATH") {
+        config.hls_audio.ffmpeg_path = v.into();
+    }
+    if let Ok(v) = std::env::var("OUTPACE_HLS_SEGMENT_PACKETS") {
+        config.hls.segment_packets = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_HLS_WINDOW_SEGMENTS") {
+        config.hls.window_segments = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_HLS_SEGMENT_DURATION_MS") {
+        config.hls.segment_duration_ms = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_HLS_STARTUP_SEGMENTS") {
+        config.hls.startup_segments = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_HLS_STARTUP_TIMEOUT_MS") {
+        config.hls.startup_timeout_ms = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_MAX_UNCHOKED") {
+        config.max_unchoked = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_MAX_INBOUND") {
+        config.max_inbound_peers = v.parse()?;
+    }
+    apply_inbound_per_stream_env(&mut config, std::env::var("OUTPACE_MAX_INBOUND_PER_STREAM"))?;
+    if let Ok(v) = std::env::var("OUTPACE_SEED_TTL_SECS") {
+        config.seed_ttl_secs = v.parse()?;
+    }
+    if let Some(v) = bool_from_env("OUTPACE_ENABLE_SEEDING")? {
+        config.enable_seeding = v;
+    }
+    if let Some(v) = bool_from_env("OUTPACE_ENABLE_INBOUND")? {
+        config.enable_inbound = v;
+    }
+    if let Some(v) = bool_from_env("OUTPACE_ENABLE_PORT_MAPPING")? {
+        config.enable_port_mapping = v;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_PORT_MAP_BACKEND") {
+        config.port_map_backend = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_PORT_MAP_EXTERNAL_PORT") {
+        config.port_map_external_port = Some(v.parse()?);
+    }
+    if let Some(v) = bool_from_env("OUTPACE_ACE_COMPAT")? {
+        config.experimental_ace_compat = v;
+    } else if let Some(v) = bool_from_env("OUTPACE_EXPERIMENTAL_ACE_COMPAT")? {
+        config.experimental_ace_compat = v;
+    }
+    if let Some(v) = bool_from_env("OUTPACE_BEP9_CONTENT_ID_FALLBACK")? {
+        config.bep9_content_id_fallback = v;
+    }
+    config.live_recovery.validate()?;
+    config.startup_buffer.validate()?;
+    config.hls.validate()?;
+    config.hls_audio.validate()?;
+    validate_cache_budget(&config)?;
+    Ok(config)
+}
+
+fn apply_broadcast_options_env(
+    config: &mut Config,
+    raw: Result<String, std::env::VarError>,
+) -> Result<(), BroadcastOptionsError> {
+    config.broadcast_options = match raw {
+        Ok(raw) => parse_broadcast_options(Some(&raw))?,
+        Err(std::env::VarError::NotPresent) => parse_broadcast_options(None)?,
+        Err(std::env::VarError::NotUnicode(_)) => return Err(BroadcastOptionsError),
+    };
+    Ok(())
+}
+
+fn apply_inbound_per_stream_env(
+    config: &mut Config,
+    raw: Result<String, std::env::VarError>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match raw {
+        Ok(value) => {
+            config.max_inbound_per_stream = value.parse::<usize>().map_err(|_| {
+                "OUTPACE_MAX_INBOUND_PER_STREAM must be an unsigned integer fitting usize"
+            })?;
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("OUTPACE_MAX_INBOUND_PER_STREAM must be valid UTF-8".into());
+        }
+    }
+    Ok(())
+}
+
+/// Construct the actual listener domain once, including canonical admission capacity.
+fn inbound_admission_from_config(config: &Config) -> ace_swarm::listen::InboundAdmission {
+    ace_swarm::listen::InboundPolicy {
+        max_inbound: config.max_inbound_peers,
+        max_per_stream: config.max_inbound_per_stream,
+        max_unchoked: config.max_unchoked,
+    }
+    .admission()
+}
+
+fn bool_from_env(name: &str) -> Result<Option<bool>, Box<dyn std::error::Error>> {
+    let value = match std::env::var(name) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(format!("{name} must be valid UTF-8 and one of: 1, true, 0, false").into());
+        }
+    };
+    match value.as_str() {
+        "1" | "true" => Ok(Some(true)),
+        "0" | "false" => Ok(Some(false)),
+        _ => Err(format!("invalid {name}: {value:?}; expected one of: 1, true, 0, false").into()),
+    }
+}
+
+/// Marker that `OUTPACE_CACHE_DIR` is a dedicated Outpace disk cache and may be wiped at startup.
+const DISK_CACHE_SENTINEL: &str = ".outpace-cache";
+
+// Resolve existing ancestors without creating a directory. Missing suffixes can be
+// projected lexically; existing symlinks must be resolved before processing `..`.
+fn projected_directory(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    use std::path::Component;
+    if path.as_os_str().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "empty cache directory",
+        ));
+    }
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut resolved = std::path::PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            other => resolved.push(other.as_os_str()),
+        }
+        match std::fs::canonicalize(&resolved) {
+            Ok(path) => {
+                if !std::fs::metadata(&path)?.is_dir() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotADirectory,
+                        "invalid cache directory",
+                    ));
+                }
+                resolved = path;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(&resolved) {
+                    Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {}
+                    _ => return Err(error), // Includes dangling symlinks.
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    match std::fs::metadata(&resolved) {
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                "invalid cache directory",
+            ))
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
+    Ok(resolved)
+}
+
+fn preflight_disk_cache_paths(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    if config.cache_type != CacheType::Disk {
+        return Ok(());
+    }
+    let cache = projected_directory(&config.cache_dir)?;
+    let data = projected_directory(&config.data_dir)?;
+    if data.starts_with(&cache) {
+        return Err("OUTPACE_CACHE_DIR must not equal or contain OUTPACE_DATA_DIR".into());
+    }
+    ensure_disk_cache_is_dedicated(&cache)
+}
+
+/// Create and resolve the disk/data roots before any persistent state is loaded or cache cleanup
+/// runs. Validation and later deletion must use this exact canonical cache path: lexically
+/// collapsing `..` first is unsafe because `symlink/..` is resolved by the filesystem relative to
+/// the symlink target, not its lexical parent.
+///
+/// A cache nested under the data directory is safe and remains the documented default. A cache
+/// equal to or containing the data directory is rejected because startup wipes the cache root.
+fn prepare_disk_cache_paths(config: &mut Config) -> Result<(), Box<dyn std::error::Error>> {
+    if config.cache_type != CacheType::Disk {
+        return Ok(());
+    }
+
+    // Directory creation is non-destructive and lets canonicalize apply the same symlink/`..`
+    // semantics that remove_dir_all will use. Do this before identity creation so a rejected
+    // relationship cannot overwrite or delete persistent state.
+    std::fs::create_dir_all(&config.cache_dir).map_err(|e| {
+        format!(
+            "cannot create OUTPACE_CACHE_DIR {}: {e}",
+            config.cache_dir.display()
+        )
+    })?;
+    std::fs::create_dir_all(&config.data_dir).map_err(|e| {
+        format!(
+            "cannot create OUTPACE_DATA_DIR {}: {e}",
+            config.data_dir.display()
+        )
+    })?;
+
+    let cache_dir = config.cache_dir.canonicalize()?;
+    let data_dir = config.data_dir.canonicalize()?;
+    if data_dir.starts_with(&cache_dir) {
+        return Err(format!(
+            "OUTPACE_CACHE_DIR {} must not equal or contain OUTPACE_DATA_DIR {}; use a cache directory nested inside the data directory or a separate path",
+            config.cache_dir.display(),
+            config.data_dir.display()
+        )
+        .into());
+    }
+    config.cache_dir = cache_dir;
+    config.data_dir = data_dir;
+    Ok(())
+}
+
+/// Startup wipe is safe only for a dedicated cache: an empty directory (first run) or one that
+/// already contains a regular [`DISK_CACHE_SENTINEL`] file. An operator path such as `/tmp` or
+/// a home directory is not dedicated merely because it is not an ancestor of `data_dir`.
+fn ensure_disk_cache_is_dedicated(
+    cache_dir: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !cache_dir.exists() {
+        return Ok(());
+    }
+    let sentinel = cache_dir.join(DISK_CACHE_SENTINEL);
+    // A symlink to an unrelated file is not a marker owned by this cache directory.
+    if std::fs::symlink_metadata(sentinel).is_ok_and(|metadata| metadata.file_type().is_file()) {
+        return Ok(());
+    }
+    let mut entries = std::fs::read_dir(cache_dir).map_err(|e| {
+        format!(
+            "cannot inspect OUTPACE_CACHE_DIR {}: {e}",
+            cache_dir.display()
+        )
+    })?;
+    if entries.next().is_none() {
+        return Ok(());
+    }
+    Err(format!(
+        "OUTPACE_CACHE_DIR {} is not a dedicated Outpace cache (missing regular {DISK_CACHE_SENTINEL} file); refusing to wipe it. Use an empty directory or create a regular {DISK_CACHE_SENTINEL} file only if all contents may be deleted",
+        cache_dir.display()
+    )
+    .into())
+}
+
+fn mark_disk_cache_dir(cache_dir: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::write(cache_dir.join(DISK_CACHE_SENTINEL), b"outpace disk cache\n").map_err(|e| {
+        format!(
+            "cannot mark OUTPACE_CACHE_DIR {} as a dedicated cache: {e}",
+            cache_dir.display()
+        )
+        .into()
+    })
+}
+
+/// Reject an in-memory retention budget that leaves insufficient target-relative address space
+/// for allocator overhead, store indexes, runtime buffers, and other active sessions. Disk cache
+/// accounting remains `u64` and is not constrained by the process's maximum object size.
+fn validate_cache_budget(config: &Config) -> Result<(), String> {
+    validate_cache_budget_for_object_limit(config, isize::MAX as u64)
+}
+
+fn validate_cache_budget_for_object_limit(
+    config: &Config,
+    max_object_bytes: u64,
+) -> Result<(), String> {
+    let safe_limit = safe_in_memory_pool_limit(max_object_bytes);
+    if config.cache_type == CacheType::Memory && config.seed_store_bytes > safe_limit {
+        return Err(format!(
+            "OUTPACE_SEED_STORE_BYTES={} exceeds this target's conservative {}-byte memory-cache limit; reduce it or set OUTPACE_CACHE_TYPE=disk",
+            config.seed_store_bytes, safe_limit
+        ));
+    }
+    Ok(())
+}
+
+pub fn bootstrap_peers_from_env() -> Vec<SocketAddrV4> {
+    // OUTPACE_ACE_PEERS=ip:port,ip:port — bootstrap peers for the proven live path
+    // until DHT / ut_metadata discovery is wired.
+    std::env::var("OUTPACE_ACE_PEERS")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect()
+}
+
+/// Resolve the tracker list minted into broadcast descriptors and used for broadcast
+/// self-announce. `OUTPACE_TRACKERS` — comma-separated `scheme://…` (typically
+/// `udp://host:port/announce`) URLs — FULLY REPLACES `DEFAULT_BROADCAST_TRACKERS` when set
+/// (non-empty after trimming); unset or blank leaves the public default in place so behavior is
+/// byte-identical to before.
+///
+/// Per-entry handling (see `classify_tracker_entry`):
+/// - No `scheme://` prefix: obviously unusable — a broadcast pointed only at such entries would
+///   be undiscoverable — so it is dropped with a warning rather than minted into a broken
+///   descriptor. Ditto entries longer than the announce path's
+///   [`ace_swarm::discover::MAX_TRACKER_URL_LEN`], which its resolver would skip anyway.
+/// - Well-formed but not lowercase `udp://` (e.g. `http://…`, `ws://…`, `UDP://…`): KEPT —
+///   other consumers of the minted descriptor may use it — but outpace's own self-announce
+///   resolver (`ace_swarm::discover::resolve_trackers`) only strips a literal lowercase
+///   `udp://` prefix, so outpace itself will never announce there; a warning says so.
+/// - The kept list is clamped to [`ace_swarm::discover::MAX_TRACKERS`] with a warning — the
+///   same cap the announce path applies.
+///
+/// If *every* override entry is dropped the result is empty (DHT-only discovery); we deliberately
+/// do NOT reinstate the public default in that case, since the operator explicitly opted out of
+/// it and silently re-announcing on a public tracker would defeat the point of the override.
+pub fn broadcast_trackers_from_env() -> Vec<String> {
+    use ace_swarm::discover::{MAX_TRACKERS, MAX_TRACKER_URL_LEN};
+    let raw = std::env::var("OUTPACE_TRACKERS").unwrap_or_default();
+    if raw.trim().is_empty() {
+        return DEFAULT_BROADCAST_TRACKERS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+    }
+    let mut out = Vec::new();
+    for s in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        match classify_tracker_entry(s) {
+            TrackerEntryClass::Udp => out.push(s.to_string()),
+            TrackerEntryClass::NonUdpScheme => {
+                crate::alog!(
+                    "[broadcast] WARNING: OUTPACE_TRACKERS entry {s:?} is not a lowercase udp:// URL; outpace only self-announces to udp:// trackers, so this entry is minted into broadcast descriptors for other clients only"
+                );
+                out.push(s.to_string());
+            }
+            TrackerEntryClass::TooLong => {
+                crate::alog!(
+                    "[broadcast] WARNING: ignoring over-long OUTPACE_TRACKERS entry ({} bytes > {MAX_TRACKER_URL_LEN} max); the announce path would skip it anyway",
+                    s.len()
+                );
+            }
+            TrackerEntryClass::Malformed => {
+                crate::alog!(
+                    "[broadcast] WARNING: ignoring malformed OUTPACE_TRACKERS entry {s:?} (no scheme:// prefix); it will not be minted into broadcast descriptors"
+                );
+            }
+        }
+    }
+    if out.len() > MAX_TRACKERS {
+        crate::alog!(
+            "[broadcast] WARNING: OUTPACE_TRACKERS has {} usable entries; keeping only the first {MAX_TRACKERS} (the announce path's cap)",
+            out.len()
+        );
+        out.truncate(MAX_TRACKERS);
+    }
+    out
+}
+
+/// How one `OUTPACE_TRACKERS` entry is treated. Pure classification (no logging) so the warn
+/// branches of [`broadcast_trackers_from_env`] are unit-testable without capturing stderr.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackerEntryClass {
+    /// Lowercase `udp://…` — minted into descriptors AND self-announced by outpace.
+    Udp,
+    /// Well-formed `scheme://rest` but not lowercase `udp://` (e.g. `http://`, `ws://`,
+    /// `UDP://`). Kept in the minted descriptor for other clients, but never self-announced:
+    /// `ace_swarm::discover::resolve_trackers` only strips a literal lowercase `udp://` prefix.
+    NonUdpScheme,
+    /// Longer than [`ace_swarm::discover::MAX_TRACKER_URL_LEN`]; the announce path skips such
+    /// entries, so minting them would be dead weight — dropped.
+    TooLong,
+    /// No `scheme://` prefix — obviously unusable, dropped. This is only a minimal sanity
+    /// check, not a full URL validator.
+    Malformed,
+}
+
+fn classify_tracker_entry(s: &str) -> TrackerEntryClass {
+    if s.len() > ace_swarm::discover::MAX_TRACKER_URL_LEN {
+        return TrackerEntryClass::TooLong;
+    }
+    match s.split_once("://") {
+        Some((scheme, rest)) if !scheme.is_empty() && !rest.is_empty() => {
+            if scheme == "udp" {
+                TrackerEntryClass::Udp
+            } else {
+                TrackerEntryClass::NonUdpScheme
+            }
+        }
+        _ => TrackerEntryClass::Malformed,
+    }
+}
+
+pub fn broadcast_ingest_urls(
+    http_bind: SocketAddr,
+    rtmp_bind: SocketAddr,
+    public_host: Option<String>,
+    name: &str,
+) -> BroadcastIngestUrls {
+    let public_host = public_host.as_deref();
+    let raw_host = public_host
+        .map(url_host)
+        .unwrap_or_else(|| url_host_from_ip(http_bind.ip()));
+    let rtmp_host = public_host
+        .map(url_host)
+        .unwrap_or_else(|| url_host_from_ip(rtmp_bind.ip()));
+    BroadcastIngestUrls {
+        raw: format!(
+            "http://{}:{}/broadcast/{}",
+            raw_host,
+            http_bind.port(),
+            name
+        ),
+        rtmp: format!("rtmp://{}:{}/live/{}", rtmp_host, rtmp_bind.port(), name),
+    }
+}
+
+fn url_host(host: &str) -> String {
+    host.parse()
+        .map(url_host_from_ip)
+        .unwrap_or_else(|_| host.to_string())
+}
+
+fn url_host_from_ip(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) => format!("[{ip}]"),
+    }
+}
+
+fn ace_provider_from_config(provider: AceProvider, config: &Config) -> AceProvider {
+    provider
+        .with_bep9_content_id_fallback(config.bep9_content_id_fallback)
+        .with_prefetch_pieces(config.prefetch_pieces)
+        .with_startup_buffer(config.startup_buffer)
+        .with_live_recovery(config.live_recovery)
+}
+
+pub async fn build_runtime(
+    mut config: Config,
+    bootstrap_peers: Vec<SocketAddrV4>,
+) -> Result<EngineRuntime, Box<dyn std::error::Error>> {
+    // Validate the complete ordered map before normalizer, filesystem, identity, or
+    // runtime side effects, including when Config was constructed directly in Rust.
+    let source_policy = FetchPolicy {
+        allow_non_global: config.allow_non_global_broadcast_source,
+    };
+    let source_configs = validate_source_map(&config.broadcast_sources, source_policy)?;
+    validate_broadcast_options(&config.broadcast_options)?;
+    if config.session_buffer == 0 {
+        return Err("OUTPACE_SESSION_BUFFER must be >= 1".into());
+    }
+    config.startup_buffer.validate()?;
+    config.live_recovery.validate()?;
+    config.hls.validate()?;
+    config.hls_audio.validate()?;
+    validate_cache_budget(&config)?;
+    preflight_broadcasts(&config)?;
+    preflight_disk_cache_paths(&config)?;
+    let normalizer = crate::hls_audio::preflight(&config.hls_audio).await?;
+
+    // This must precede identity creation and, critically, the disk cache's remove_dir_all.
+    // `build_runtime` is the single validation boundary for both env-derived Config and direct
+    // library/test callers, and it runs before any destructive operation.
+    prepare_disk_cache_paths(&mut config)?;
+    let identity = Arc::new(load_or_create_identity(&config.data_dir)?);
+
+    // Fail fast on a misconfigured disk cache, and start from a clean slate: wipe the cache root
+    // so per-infohash dirs orphaned by a hard crash (no `Drop` ran) don't survive a restart. The
+    // cache is ephemeral (piece data goes stale; broadcasts rebuild theirs from live ingest), so
+    // wiping a dedicated cache is safe. An unmarked operator path is not wiped.
+    if config.cache_type == CacheType::Disk {
+        if config.cache_dir.exists() {
+            ensure_disk_cache_is_dedicated(&config.cache_dir)?;
+            std::fs::remove_dir_all(&config.cache_dir).map_err(|e| {
+                format!(
+                    "cannot clear OUTPACE_CACHE_DIR {}: {e}",
+                    config.cache_dir.display()
+                )
+            })?;
+        }
+        std::fs::create_dir_all(&config.cache_dir).map_err(|e| {
+            format!(
+                "cannot create OUTPACE_CACHE_DIR {}: {e}",
+                config.cache_dir.display()
+            )
+        })?;
+        mark_disk_cache_dir(&config.cache_dir)?;
+    }
+
+    // Register enabled providers. Only "ace" exists today; the registry is the path for more.
+    let seed_registry = ace_swarm::listen::SeedRegistry::new();
+    // Public-reachability monitor (issue #22): only created when inbound serving is on. With
+    // inbound off we can never be dialed, so nothing harvests `yourip` or counts inbound peers
+    // and the whole feature is inert — no behavior change (issue #22 task 5).
+    let reachability = config
+        .enable_inbound
+        .then(|| Arc::new(ace_swarm::reachability::ReachabilityMonitor::new()));
+    let mut registry = ProviderRegistry::new();
+    // The single resolved external inbound endpoint. Advertise the *peer* port, never the HTTP
+    // API port (issue #21); `None` when inbound serving is off (no listener to back it). Both
+    // the leech/seeder self-announce and `broadcasts.inbound_peer_port` are threaded from this
+    // one value so tracker + DHT + PEX advertise one identical endpoint.
+    let inbound_peer_port = config.enable_inbound.then_some(config.peer_listen.port());
+    let (announce_port_tx, announce_port_rx) = tokio::sync::watch::channel(inbound_peer_port);
+    if config.networks.iter().any(|n| n == "ace") {
+        let provider = AceProvider::new(identity.clone(), config.peer_listen.port())
+            .with_bootstrap_peers(bootstrap_peers)
+            .with_seed_registry(seed_registry.clone())
+            .with_seed_store_bytes(config.seed_store_bytes)
+            .with_seed_store_retention(std::time::Duration::from_secs(config.seed_retention_secs))
+            .with_cache(config.cache_type, config.cache_dir.clone());
+        let provider = ace_provider_from_config(provider, &config)
+            .with_seeding_enabled(config.enable_seeding)
+            .with_inbound_announce_port_receiver(announce_port_rx.clone())
+            .with_reachability(reachability.clone());
+        registry.register(Arc::new(provider));
+    }
+    let networks: Vec<String> = registry.networks().iter().map(|s| s.to_string()).collect();
+
+    let manager = StreamManager::with_admission_config(
+        registry,
+        config.session_buffer,
+        config.hls,
+        normalizer,
+        config.max_sessions,
+    );
+    manager.spawn_reaper();
+    if config.seed_ttl_secs > 0 {
+        let seed_registry_reap = seed_registry.clone();
+        let ttl = std::time::Duration::from_secs(config.seed_ttl_secs);
+        tokio::spawn(async move {
+            // Sweep at a fraction of the TTL so an idle entry is reclaimed within ~1.25x the TTL.
+            let interval = (ttl / 4).max(std::time::Duration::from_secs(5));
+            loop {
+                tokio::time::sleep(interval).await;
+                let n = seed_registry_reap.reap(ttl);
+                if n > 0 {
+                    crate::alog!("[seed] reaped {n} idle leech registry entr(y/ies)");
+                }
+            }
+        });
+    }
+    if config.enable_inbound {
+        let rechoke_registry = seed_registry.clone();
+        tokio::spawn(async move {
+            // BitTorrent's classic rechoke cadence is ~10s; rotate the optimistic-unchoke slot on
+            // that beat so newcomers periodically get a turn even on a saturated stream.
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
+            loop {
+                ticker.tick().await;
+                rechoke_registry.rechoke_all();
+            }
+        });
+    }
+    let broadcasts = BroadcastState {
+        registry: BroadcastRegistry::with_persist_and_options(
+            &config.data_dir,
+            config.cache_type,
+            config.cache_dir.clone(),
+            config.broadcast_options.clone(),
+        )?,
+        seed_registry: seed_registry.clone(),
+        // Process trackers select fresh identities only. Resumed announcements use the
+        // validated transport's own list, including an empty list.
+        trackers: broadcast_trackers_from_env(),
+        store_bytes: config.seed_store_bytes,
+        inbound_peer_port: announce_port_rx,
+    };
+
+    broadcasts.registry.set_source_policy(source_policy);
+
+    // Reconstruct/reserve identities without starting announcements or readers. Serving
+    // startup owns network work only after listeners are established.
+    let reloaded = match broadcasts
+        .registry
+        .reload_persisted(
+            &broadcasts.seed_registry,
+            broadcasts.store_bytes,
+            &source_configs.keys().cloned().collect(),
+        )
+        .await
+    {
+        Ok(reloaded) => reloaded,
+        Err(error) => {
+            broadcasts.close_admissions();
+            let _ = broadcasts.shutdown().await;
+            manager.shutdown().await;
+            return Err(Box::new(error));
+        }
+    };
+    if !reloaded.is_empty() {
+        crate::alog!(
+            "[broadcast] reloaded {} persisted broadcast(s)",
+            reloaded.len()
+        );
+    }
+
+    Ok(EngineRuntime {
+        config,
+        networks,
+        manager,
+        seed_registry,
+        broadcasts,
+        reachability,
+        announce_port_tx,
+        identity,
+        source_configs,
+    })
+}
+
+pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error::Error>> {
+    serve_http_until(runtime, shutdown_signal()).await
+}
+
+/// The real serving/cleanup path accepts a shutdown future, allowing controlled local
+/// lifecycle tests without process-global signal/environment mutation.
+pub(crate) async fn serve_http_until(
+    runtime: EngineRuntime,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let manager = runtime.manager.clone();
+    let broadcasts = runtime.broadcasts.clone();
+    let result = serve_http_inner(runtime, shutdown).await;
+    broadcasts.close_admissions();
+    let cleanup = broadcasts.shutdown().await;
+    // Both listener/startup errors and normal HTTP draining must finish HLS cleanup.
+    manager.shutdown().await;
+    match (result, cleanup) {
+        (Err(error), cleanup) => {
+            if let Err(cleanup) = cleanup {
+                crate::alog!("[broadcast] cleanup: {}", cleanup.code());
+            }
+            Err(error)
+        }
+        (Ok(()), Err(error)) => Err(Box::new(error)),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+async fn serve_http_inner(
+    runtime: EngineRuntime,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let EngineRuntime {
+        config,
+        networks,
+        manager,
+        seed_registry,
+        broadcasts,
+        reachability,
+        announce_port_tx,
+        identity,
+        source_configs,
+    } = runtime;
+    let mut shutdown = Box::pin(shutdown);
+
+    // Startup banner: plain `eprintln!` on purpose. These lines are read live by whoever
+    // just ran the daemon, so they intentionally skip the `alog!` timestamp/`[tag]` prefix.
+    // Operational events that fire *later* (RTMP death, shutdown) do use `alog!`; see the
+    // `ace_log` crate docs before adding a line here.
+    eprintln!(
+        "outpace: node_id={} data_dir={}",
+        hex_node_id(&identity),
+        config.data_dir.display()
+    );
+
+    let rtmp_bind = config.rtmp_bind;
+    let state = AppState {
+        manager,
+        networks: networks.clone(),
+        resolve_content_ids_in_getstream: true,
+        ace_sessions: Arc::new(crate::http::AceSessionStore::default()),
+        experimental_ace_compat: config.experimental_ace_compat,
+        broadcasts: Some(broadcasts.clone()),
+    };
+
+    // Held for the process lifetime so the gateway port-mapping renewal task keeps running and
+    // the mapping is torn down on shutdown (handle drop). `None` unless port mapping is enabled
+    // and succeeds. The `_` prefix marks it as a lifetime guard rather than a read value.
+    let mut _port_map_handle: Option<ace_swarm::portmap::PortMapHandle> = None;
+
+    // Inbound seeding (S2): ON by default, matching the Acestream engine's out-of-the-box
+    // behavior as a full P2P participant (bind the peer port, accept inbound peers, seed,
+    // self-announce). Piece headers are preserved/generated and official-consumer piece
+    // acceptance is live-proven (note 33). Opt out with `OUTPACE_ENABLE_INBOUND=0`.
+    if config.enable_inbound {
+        let peer_listener = tokio::net::TcpListener::bind(config.peer_listen).await?;
+        let bound_peer_port = peer_listener.local_addr()?.port();
+        eprintln!(
+            "outpace: inbound seeding ENABLED on {} (max {} peers)",
+            config.peer_listen, config.max_inbound_peers
+        );
+        let listener_peer_id = ace_wire::handshake::random_peer_id();
+        let inbound_registry = seed_registry.clone();
+        let inbound_admission = inbound_admission_from_config(&config);
+        let listener_identity = identity.clone();
+        let listener_reachability = reachability.clone();
+        tokio::spawn(async move {
+            ace_swarm::listen::PeerListener::serve_with_policy(
+                peer_listener,
+                inbound_registry,
+                listener_peer_id,
+                [0u8; 8],
+                inbound_admission,
+                listener_identity,
+                listener_reachability,
+            )
+            .await;
+        });
+
+        // NAT reachability (issue #20): map the peer port on the home gateway so peers behind
+        // NAT can dial us. Gated behind the new `enable_port_mapping` (default off) in addition
+        // to `enable_inbound`; best-effort and non-fatal — a failure logs and the daemon
+        // continues. `spawn_port_mapping` returns immediately and does ALL gateway discovery in
+        // a background task, so startup never blocks on slow SSDP / NAT-PMP retries. The task
+        // logs and publishes the resolved endpoint (for the announce path, #21, via
+        // `PortMapHandle::endpoint_receiver`) once established. The handle is held for the
+        // process lifetime so its renewal task runs and the mapping is deleted on shutdown
+        // (handle drop).
+        if config.enable_port_mapping {
+            let pm_cfg = ace_swarm::portmap::PortMapConfig {
+                backend: config.port_map_backend,
+                internal_port: config.peer_listen.port(),
+                external_port: config.port_map_external_port,
+                lease_seconds: ace_swarm::portmap::DEFAULT_LEASE_SECONDS,
+            };
+            eprintln!(
+                "outpace: port mapping ENABLED (backend={}, internal port {}); resolving gateway in background",
+                config.port_map_backend,
+                config.peer_listen.port()
+            );
+            _port_map_handle = ace_swarm::portmap::spawn_port_mapping(pm_cfg);
+            if let Some(handle) = &_port_map_handle {
+                let mapped_rx = handle.endpoint_receiver();
+                tokio::spawn(propagate_mapped_announce_port(
+                    mapped_rx,
+                    announce_port_tx,
+                    config.peer_listen.port(),
+                ));
+            }
+        }
+
+        // Public-reachability status (issue #22): turn note 24's open "nothing proven to dial us
+        // back" question into an observable answer. We hold a monitor only when inbound serving
+        // is on, so this runs exactly when there is a listener that could actually be reached.
+        // The port-mapping endpoint receiver (when mapping is enabled) feeds the `yourip` vs
+        // mapped-external-IP cross-check that flags double-NAT / CGNAT.
+        if let Some(monitor) = reachability.clone() {
+            let endpoint_rx = _port_map_handle.as_ref().map(|h| h.endpoint_receiver());
+            tokio::spawn(reachability_status_loop(
+                monitor,
+                endpoint_rx,
+                bound_peer_port,
+            ));
+        }
+    }
+
+    // Bind HTTP before starting broadcast-owned network work. RTMP keeps its existing
+    // dependency listener/bind behavior; its owned handle is stopped on every exit path.
+    let listener = tokio::net::TcpListener::bind(config.bind).await?;
+    let mut rtmp = OwnedRtmpListener::start(rtmp_bind, broadcasts.clone());
+    eprintln!(
+        "outpace: RTMP ingest listening on rtmp://{}/live/<name>",
+        config.rtmp_bind
+    );
+    eprintln!(
+        "outpace: listening on http://{} networks={:?}",
+        config.bind, networks
+    );
+    eprintln!(
+        "  MPEG-TS: http://{}/streams/ace/cid:<content-id>",
+        config.bind
+    );
+    eprintln!(
+        "  HLS:     http://{}/streams/ace/cid:<content-id>.m3u8",
+        config.bind
+    );
+    eprintln!("  Live ids: bare hex or cid: selects a content id; ih: selects a verified infohash");
+    eprintln!("  status:  http://{}/streams", config.bind);
+    let cancel_rtmp = rtmp.cancel.clone();
+    let draining_broadcasts = broadcasts.clone();
+    let result: Result<(), Box<dyn std::error::Error>> = async {
+        let startup = async {
+            // BTreeMap iteration is deterministic; API traffic cannot race these claims.
+            for (name, config) in source_configs {
+                broadcasts.attach_source(&name, config).await?;
+            }
+            for name in broadcasts.registry.names().await {
+                broadcasts.ensure_announcing(&name).await?;
+            }
+            Ok::<(), BroadcastError>(())
+        };
+        tokio::select! {
+            biased;
+            () = &mut shutdown => return Ok(()),
+            result = startup => result?,
+        }
+        axum::serve(listener, router(state))
+            .with_graceful_shutdown(async move {
+                shutdown.await;
+                // Close/cancel before HTTP graceful drain can wait on a live request body.
+                draining_broadcasts.close_admissions();
+                cancel_rtmp.send_replace(true);
+                if let Err(error) = draining_broadcasts.shutdown().await {
+                    crate::alog!("[broadcast] shutdown: {}", error.code());
+                }
+            })
+            .await?;
+        Ok(())
+    }
+    .await;
+    broadcasts.close_admissions();
+    rtmp.stop(broadcasts.registry.cleanup_deadline()).await;
+    result
+}
+
+/// Only the listener belongs to the runtime. rtmp-rs owns established connections; the
+/// registry's producer cancellation/barriers fence their subsequent broadcast callbacks.
+struct OwnedRtmpListener {
+    cancel: tokio::sync::watch::Sender<bool>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+impl OwnedRtmpListener {
+    fn start(bind: SocketAddr, broadcasts: BroadcastState) -> Self {
+        let (cancel, rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move {
+            if crate::rtmp::serve_rtmp(bind, broadcasts, rx).await.is_err() {
+                crate::alog!("[rtmp] ingest stopped: listener_failed");
+            }
+        });
+        Self {
+            cancel,
+            task: Some(task),
+        }
+    }
+    async fn stop(&mut self, deadline: tokio::time::Instant) {
+        self.cancel.send_replace(true);
+        if let Some(mut task) = self.task.take() {
+            if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+    }
+}
+impl Drop for OwnedRtmpListener {
+    fn drop(&mut self) {
+        self.cancel.send_replace(true);
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C signal handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {},
+        () = terminate => {},
+    }
+    crate::alog!("[runtime] shutdown signal received; draining HTTP connections");
+}
+
+pub async fn mint_broadcast(
+    runtime: &EngineRuntime,
+    name: &str,
+) -> Result<Broadcast, BroadcastError> {
+    runtime.broadcasts.mint(name).await
+}
+
+pub async fn announce_broadcast(runtime: &EngineRuntime, name: &str) -> Result<(), BroadcastError> {
+    runtime.broadcasts.ensure_announcing(name).await
+}
+
+async fn propagate_mapped_announce_port(
+    mut mapped_rx: tokio::sync::watch::Receiver<Option<ace_swarm::portmap::MappedEndpoint>>,
+    announce_tx: tokio::sync::watch::Sender<Option<u16>>,
+    local_port: u16,
+) {
+    loop {
+        let port = mapped_rx
+            .borrow_and_update()
+            .as_ref()
+            .map_or(local_port, |endpoint| endpoint.external_port);
+        announce_tx.send_replace(Some(port));
+        if mapped_rx.changed().await.is_err() {
+            announce_tx.send_replace(Some(local_port));
+            // Keep the sender alive so existing announce loops continue their normal periodic
+            // fallback announces after the mapping task has ended.
+            return std::future::pending().await;
+        }
+    }
+}
+
+/// Periodically log the daemon's public-reachability status (issue #22): whether an unsolicited
+/// inbound peer has confirmed us reachable, the public IP peers echo via `yourip`, and — when a
+/// gateway mapping (#20) is present — a `yourip` vs mapped-external-IP cross-check that warns on
+/// a mismatch (the double-NAT / CGNAT signature). `endpoint_rx` is `None` when port mapping is
+/// disabled, in which case the cross-check is simply skipped.
+async fn reachability_status_loop(
+    monitor: Arc<ace_swarm::reachability::ReachabilityMonitor>,
+    endpoint_rx: Option<tokio::sync::watch::Receiver<Option<ace_swarm::portmap::MappedEndpoint>>>,
+    listener_port: u16,
+) {
+    use ace_swarm::reachability::CrossCheck;
+    let started = tokio::time::Instant::now();
+    let mut ticker = tokio::time::interval(REACHABILITY_STATUS_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        let mapped = endpoint_rx.as_ref().and_then(|rx| rx.borrow().clone());
+        let mapped_ip = mapped.as_ref().and_then(|e| e.external_ip);
+        // The status line's "external" endpoint is the gateway-mapped one (only when the backend
+        // reported an external IP); the observed `yourip` is always reported separately.
+        let external = mapped
+            .as_ref()
+            .and_then(|e| e.external_ip.map(|ip| (ip, e.external_port)));
+        crate::alog!("[reachability] {}", monitor.status_line(external));
+        if monitor.take_troubleshooting_hint(started.elapsed()) {
+            let advertised_port = mapped
+                .as_ref()
+                .map_or(listener_port, |endpoint| endpoint.external_port);
+            crate::alog!(
+                "[reachability] HINT: after 10 minutes, no inbound peers or yourip observations; check advertised peer TCP port {advertised_port}: router port forwarding may be missing, a host/VPN/WARP firewall may block inbound connections, or UPnP/NAT-PMP may be disabled or unanswered"
+            );
+        }
+        if let CrossCheck::Mismatch { observed, mapped } = monitor.cross_check(mapped_ip) {
+            crate::alog!(
+                "[reachability] WARNING: observed public IP {observed} (from peer yourip) differs from the mapped external IP {mapped} — likely double-NAT / CGNAT (the gateway mapped a private upstream address); inbound dials to {mapped} may never reach us"
+            );
+        }
+    }
+}
+
+fn hex_node_id(identity: &ace_wire::identity::Identity) -> String {
+    identity
+        .node_id()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct CompatEnvRestore([Option<std::ffi::OsString>; 2]);
+
+    impl CompatEnvRestore {
+        fn new() -> Self {
+            let names = ["OUTPACE_ACE_COMPAT", "OUTPACE_EXPERIMENTAL_ACE_COMPAT"];
+            let old = names.map(std::env::var_os);
+            for name in names {
+                std::env::remove_var(name);
+            }
+            Self(old)
+        }
+    }
+
+    impl Drop for CompatEnvRestore {
+        fn drop(&mut self) {
+            for (name, value) in ["OUTPACE_ACE_COMPAT", "OUTPACE_EXPERIMENTAL_ACE_COMPAT"]
+                .into_iter()
+                .zip(self.0.iter())
+            {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ace_compat_environment_prefers_canonical_and_strictly_parses_selected_value() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _restore = CompatEnvRestore::new();
+        let mut failures = Vec::new();
+        macro_rules! check {
+            ($condition:expr, $label:expr) => {
+                if !$condition {
+                    failures.push($label);
+                }
+            };
+        }
+        macro_rules! check_error_name {
+            ($result:expr, $name:literal, $label:expr) => {
+                match $result {
+                    Err(error) => {
+                        if !error.to_string().contains($name) {
+                            failures.push($label);
+                        }
+                    }
+                    Ok(_) => failures.push($label),
+                }
+            };
+        }
+
+        check!(
+            matches!(config_from_env(), Ok(c) if !c.experimental_ace_compat),
+            "default is off"
+        );
+        for (value, expected) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            std::env::set_var("OUTPACE_ACE_COMPAT", value);
+            check!(
+                matches!(config_from_env(), Ok(c) if c.experimental_ace_compat == expected),
+                "canonical boolean values"
+            );
+        }
+
+        std::env::remove_var("OUTPACE_ACE_COMPAT");
+        for (value, expected) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            std::env::set_var("OUTPACE_EXPERIMENTAL_ACE_COMPAT", value);
+            check!(
+                matches!(config_from_env(), Ok(c) if c.experimental_ace_compat == expected),
+                "legacy fallback values"
+            );
+        }
+
+        std::env::set_var("OUTPACE_ACE_COMPAT", "0");
+        std::env::set_var("OUTPACE_EXPERIMENTAL_ACE_COMPAT", "1");
+        check!(
+            matches!(config_from_env(), Ok(c) if !c.experimental_ace_compat),
+            "canonical false beats legacy true"
+        );
+        std::env::set_var("OUTPACE_ACE_COMPAT", "1");
+        std::env::set_var("OUTPACE_EXPERIMENTAL_ACE_COMPAT", "0");
+        check!(
+            matches!(config_from_env(), Ok(c) if c.experimental_ace_compat),
+            "canonical true beats legacy false"
+        );
+
+        std::env::set_var("OUTPACE_EXPERIMENTAL_ACE_COMPAT", "1");
+        for value in ["", "yes"] {
+            std::env::set_var("OUTPACE_ACE_COMPAT", value);
+            check_error_name!(
+                config_from_env(),
+                "OUTPACE_ACE_COMPAT",
+                "invalid canonical fails even with valid legacy"
+            );
+        }
+        std::env::remove_var("OUTPACE_ACE_COMPAT");
+        for value in ["", "invalid"] {
+            std::env::set_var("OUTPACE_EXPERIMENTAL_ACE_COMPAT", value);
+            check_error_name!(
+                config_from_env(),
+                "OUTPACE_EXPERIMENTAL_ACE_COMPAT",
+                "selected invalid legacy value fails"
+            );
+        }
+
+        std::env::set_var("OUTPACE_ACE_COMPAT", "true");
+        check!(
+            matches!(config_from_env(), Ok(c) if c.experimental_ace_compat),
+            "valid canonical ignores invalid legacy"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let non_unicode = std::ffi::OsString::from_vec(vec![0xff]);
+            std::env::set_var("OUTPACE_EXPERIMENTAL_ACE_COMPAT", "1");
+            std::env::set_var("OUTPACE_ACE_COMPAT", &non_unicode);
+            check_error_name!(
+                config_from_env(),
+                "OUTPACE_ACE_COMPAT",
+                "selected canonical non-Unicode fails despite valid legacy"
+            );
+            std::env::remove_var("OUTPACE_ACE_COMPAT");
+            std::env::set_var("OUTPACE_EXPERIMENTAL_ACE_COMPAT", &non_unicode);
+            check_error_name!(
+                config_from_env(),
+                "OUTPACE_EXPERIMENTAL_ACE_COMPAT",
+                "selected legacy non-Unicode fails"
+            );
+            std::env::set_var("OUTPACE_ACE_COMPAT", "true");
+            check!(
+                matches!(config_from_env(), Ok(c) if c.experimental_ace_compat),
+                "canonical ignores non-Unicode legacy"
+            );
+        }
+        drop(_restore);
+        drop(_lock);
+        assert!(
+            failures.is_empty(),
+            "failed compatibility cases: {failures:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_false_keeps_compat_routes_off_and_native_health_available() {
+        use axum::{body::Body, http::Request, http::StatusCode};
+        use tower::ServiceExt;
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _restore = CompatEnvRestore::new();
+        std::env::set_var("OUTPACE_ACE_COMPAT", "false");
+        std::env::set_var("OUTPACE_EXPERIMENTAL_ACE_COMPAT", "1");
+        let config = config_from_env().unwrap();
+        let disabled = !config.experimental_ace_compat;
+
+        let app = router(AppState {
+            manager: StreamManager::new(ProviderRegistry::new()),
+            networks: Vec::new(),
+            resolve_content_ids_in_getstream: false,
+            ace_sessions: Arc::new(crate::http::AceSessionStore::default()),
+            experimental_ace_compat: config.experimental_ace_compat,
+            broadcasts: None,
+        });
+        drop(_restore);
+        drop(_lock);
+        let health = app
+            .clone()
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let compat = app
+            .oneshot(
+                Request::get("/server/api?method=get_version")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(disabled, "canonical false must override legacy true");
+        assert_eq!(health.status(), StatusCode::OK);
+        assert_eq!(compat.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn daemon_provider_receives_startup_buffer_from_runtime_config() {
+        let config = Config {
+            startup_buffer: crate::config::StartupBufferConfig {
+                target_ms: 10_000,
+                max_bytes: 33_554_432,
+                timeout_ms: 9_000,
+            },
+            ..Config::default()
+        };
+        let provider = ace_provider_from_config(
+            AceProvider::new(
+                Arc::new(ace_wire::identity::Identity::generate()),
+                config.peer_listen.port(),
+            ),
+            &config,
+        );
+
+        assert_eq!(provider.startup_buffer_config(), config.startup_buffer);
+    }
+
+    #[test]
+    fn daemon_provider_receives_bep9_policy_from_config() {
+        for enabled in [false, true] {
+            let config = Config {
+                bep9_content_id_fallback: enabled,
+                ..Config::default()
+            };
+            let provider = ace_provider_from_config(
+                AceProvider::new(Arc::new(ace_wire::identity::Identity::generate()), 0),
+                &config,
+            );
+            assert_eq!(
+                crate::ace_provider::test_support::bep9_enabled(&provider),
+                enabled
+            );
+        }
+    }
+
+    #[test]
+    fn bep9_fallback_env_defaults_off_and_parses_strictly() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let name = "OUTPACE_BEP9_CONTENT_ID_FALLBACK";
+        let old = std::env::var_os(name);
+        std::env::remove_var(name);
+        assert!(!config_from_env().unwrap().bep9_content_id_fallback);
+        for (value, expected) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            std::env::set_var(name, value);
+            assert_eq!(
+                config_from_env().unwrap().bep9_content_id_fallback,
+                expected
+            );
+        }
+        for invalid in ["", "yes", "TRUE", " true", "1 "] {
+            std::env::set_var(name, invalid);
+            assert!(config_from_env().unwrap_err().to_string().contains(name));
+        }
+        match old {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
+    }
+
+    #[test]
+    fn hls_audio_normalization_env_defaults_off_and_parses_only_exact_booleans() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let normalize = "OUTPACE_HLS_AUDIO_NORMALIZE";
+        let ffmpeg = "OUTPACE_FFMPEG_PATH";
+        let old_normalize = std::env::var_os(normalize);
+        let old_ffmpeg = std::env::var_os(ffmpeg);
+        std::env::remove_var(normalize);
+        std::env::remove_var(ffmpeg);
+        assert!(!config_from_env().unwrap().hls_audio.normalize);
+        assert_eq!(
+            config_from_env().unwrap().hls_audio.ffmpeg_path,
+            std::path::Path::new("ffmpeg")
+        );
+        for (value, expected) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            std::env::set_var(normalize, value);
+            assert_eq!(config_from_env().unwrap().hls_audio.normalize, expected);
+        }
+        for invalid in ["", "yes", "TRUE", " true", "1 "] {
+            std::env::set_var(normalize, invalid);
+            assert!(config_from_env()
+                .unwrap_err()
+                .to_string()
+                .contains(normalize));
+        }
+        std::env::set_var(normalize, "true");
+        std::env::set_var(ffmpeg, "");
+        assert!(config_from_env().unwrap_err().to_string().contains(ffmpeg));
+        match old_normalize {
+            Some(value) => std::env::set_var(normalize, value),
+            None => std::env::remove_var(normalize),
+        }
+        match old_ffmpeg {
+            Some(value) => std::env::set_var(ffmpeg, value),
+            None => std::env::remove_var(ffmpeg),
+        }
+    }
+
+    #[test]
+    fn rtmp_bind_env_override_sets_config_rtmp_bind() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old = std::env::var_os("OUTPACE_RTMP_BIND");
+
+        std::env::set_var("OUTPACE_RTMP_BIND", "127.0.0.1:19935");
+        let config = config_from_env();
+        match old {
+            Some(value) => std::env::set_var("OUTPACE_RTMP_BIND", value),
+            None => std::env::remove_var("OUTPACE_RTMP_BIND"),
+        }
+
+        let config = config.unwrap();
+        assert_eq!(config.rtmp_bind, "127.0.0.1:19935".parse().unwrap());
+    }
+
+    #[test]
+    fn broadcast_trackers_env_override_parsing() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let old = std::env::var_os("OUTPACE_TRACKERS");
+
+        let default: Vec<String> = DEFAULT_BROADCAST_TRACKERS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        // Unset -> untouched defaults.
+        std::env::remove_var("OUTPACE_TRACKERS");
+        assert_eq!(broadcast_trackers_from_env(), default);
+
+        // Blank / whitespace-only -> defaults (treated as unset).
+        std::env::set_var("OUTPACE_TRACKERS", "   ");
+        assert_eq!(broadcast_trackers_from_env(), default);
+
+        // Single URL fully replaces the default.
+        std::env::set_var("OUTPACE_TRACKERS", "udp://a.local:1/announce");
+        assert_eq!(
+            broadcast_trackers_from_env(),
+            vec!["udp://a.local:1/announce".to_string()]
+        );
+
+        // Multiple, comma-separated, with surrounding whitespace and a trailing comma.
+        std::env::set_var(
+            "OUTPACE_TRACKERS",
+            " udp://a.local:1/announce , udp://b.local:2/announce ,",
+        );
+        assert_eq!(
+            broadcast_trackers_from_env(),
+            vec![
+                "udp://a.local:1/announce".to_string(),
+                "udp://b.local:2/announce".to_string(),
+            ]
+        );
+
+        // Malformed entry (no scheme) is dropped; valid siblings survive.
+        std::env::set_var("OUTPACE_TRACKERS", "udp://a.local:1/announce,not-a-url");
+        assert_eq!(
+            broadcast_trackers_from_env(),
+            vec!["udp://a.local:1/announce".to_string()]
+        );
+
+        // All entries malformed -> empty list; we deliberately do NOT fall back to the public
+        // default (the operator opted out of it), so the broadcast is DHT-only rather than
+        // silently re-announced on t1.torrentstream.org.
+        std::env::set_var("OUTPACE_TRACKERS", "nope,also-bad");
+        assert!(broadcast_trackers_from_env().is_empty());
+
+        // Non-udp and uppercase-UDP schemes are KEPT (minted for other descriptor consumers)
+        // even though outpace itself won't self-announce to them (warn-only path).
+        std::env::set_var(
+            "OUTPACE_TRACKERS",
+            "http://t.local/announce,UDP://h.local:1/announce,udp://a.local:1/announce",
+        );
+        assert_eq!(
+            broadcast_trackers_from_env(),
+            vec![
+                "http://t.local/announce".to_string(),
+                "UDP://h.local:1/announce".to_string(),
+                "udp://a.local:1/announce".to_string(),
+            ]
+        );
+
+        // Over-long entries are dropped (announce path would skip them anyway).
+        let long = format!("udp://{}:1/announce", "h".repeat(300));
+        std::env::set_var(
+            "OUTPACE_TRACKERS",
+            format!("{long},udp://a.local:1/announce"),
+        );
+        assert_eq!(
+            broadcast_trackers_from_env(),
+            vec!["udp://a.local:1/announce".to_string()]
+        );
+
+        // The kept list is clamped to the announce path's MAX_TRACKERS cap.
+        let many: Vec<String> = (0..70).map(|i| format!("udp://t{i}.local:1/a")).collect();
+        std::env::set_var("OUTPACE_TRACKERS", many.join(","));
+        let clamped = broadcast_trackers_from_env();
+        assert_eq!(clamped.len(), ace_swarm::discover::MAX_TRACKERS);
+        assert_eq!(clamped[..], many[..ace_swarm::discover::MAX_TRACKERS]);
+
+        match old {
+            Some(v) => std::env::set_var("OUTPACE_TRACKERS", v),
+            None => std::env::remove_var("OUTPACE_TRACKERS"),
+        }
+    }
+
+    #[test]
+    fn tracker_entry_classification_matches_self_announce_reality() {
+        use TrackerEntryClass::*;
+        // Self-announced: only a literal lowercase udp:// scheme (what
+        // ace_swarm::discover::resolve_trackers strips).
+        assert_eq!(classify_tracker_entry("udp://t.local:1/announce"), Udp);
+        // Kept-but-warned: well-formed, but outpace never self-announces to these.
+        assert_eq!(
+            classify_tracker_entry("http://t.local/announce"),
+            NonUdpScheme
+        );
+        assert_eq!(
+            classify_tracker_entry("ws://t.local/announce"),
+            NonUdpScheme
+        );
+        assert_eq!(
+            classify_tracker_entry("UDP://t.local:1/announce"),
+            NonUdpScheme,
+            "resolve_trackers only matches lowercase udp://, so uppercase must be flagged"
+        );
+        // Dropped-and-warned.
+        assert_eq!(classify_tracker_entry("t.local:1"), Malformed);
+        assert_eq!(classify_tracker_entry("://rest"), Malformed);
+        assert_eq!(classify_tracker_entry("udp://"), Malformed);
+        let long = format!("udp://{}:1/a", "h".repeat(300));
+        assert_eq!(classify_tracker_entry(&long), TooLong);
+    }
+
+    #[tokio::test]
+    async fn minted_broadcast_descriptor_reflects_tracker_override() {
+        // Resolve the override under the env lock, then drop the guard before the async mint so a
+        // std mutex is never held across an await.
+        let trackers = {
+            let _g = ENV_LOCK.lock().unwrap();
+            let old = std::env::var_os("OUTPACE_TRACKERS");
+            std::env::set_var(
+                "OUTPACE_TRACKERS",
+                "udp://priv.local:1337/announce,udp://priv2.local:2/announce",
+            );
+            let t = broadcast_trackers_from_env();
+            match old {
+                Some(v) => std::env::set_var("OUTPACE_TRACKERS", v),
+                None => std::env::remove_var("OUTPACE_TRACKERS"),
+            }
+            t
+        };
+
+        let reg = crate::broadcast::BroadcastRegistry::new();
+        let seed = ace_swarm::listen::SeedRegistry::new();
+        let bc = reg.mint("t", &trackers, &seed, 1 << 20).await.unwrap();
+        let decoded = ace_wire::transport::decode_transport(&bc.transport_bytes).unwrap();
+        assert_eq!(
+            decoded.trackers,
+            vec![
+                "udp://priv.local:1337/announce".to_string(),
+                "udp://priv2.local:2/announce".to_string(),
+            ],
+            "minted descriptor must carry the OUTPACE_TRACKERS override, not the public default"
+        );
+    }
+
+    #[test]
+    fn broadcast_urls_use_raw_and_rtmp_labels() {
+        let http = "127.0.0.1:6878".parse().unwrap();
+        let rtmp = "127.0.0.1:1935".parse().unwrap();
+        let urls = broadcast_ingest_urls(http, rtmp, None, "mychan");
+
+        assert_eq!(urls.raw, "http://127.0.0.1:6878/broadcast/mychan");
+        assert_eq!(urls.rtmp, "rtmp://127.0.0.1:1935/live/mychan");
+    }
+
+    #[test]
+    fn broadcast_urls_use_public_host_for_displayed_hosts() {
+        let http = "0.0.0.0:6878".parse().unwrap();
+        let rtmp = "0.0.0.0:1935".parse().unwrap();
+        let urls = broadcast_ingest_urls(http, rtmp, Some("stream.example".to_string()), "mychan");
+
+        assert_eq!(urls.raw, "http://stream.example:6878/broadcast/mychan");
+        assert_eq!(urls.rtmp, "rtmp://stream.example:1935/live/mychan");
+    }
+
+    #[test]
+    fn broadcast_urls_use_bracketed_ipv6_bind_hosts() {
+        let http = "[::1]:6878".parse().unwrap();
+        let rtmp = "[::1]:1935".parse().unwrap();
+        let urls = broadcast_ingest_urls(http, rtmp, None, "mychan");
+
+        assert_eq!(urls.raw, "http://[::1]:6878/broadcast/mychan");
+        assert_eq!(urls.rtmp, "rtmp://[::1]:1935/live/mychan");
+    }
+
+    #[test]
+    fn parses_playback_policy_and_distinguishes_absent_prefetch() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let names = [
+            "OUTPACE_PREBUFFER_MS",
+            "OUTPACE_PREBUFFER_BYTES",
+            "OUTPACE_PREBUFFER_TIMEOUT_MS",
+            "OUTPACE_HLS_STARTUP_SEGMENTS",
+            "OUTPACE_HLS_STARTUP_TIMEOUT_MS",
+            "OUTPACE_PREFETCH_PIECES",
+            "OUTPACE_SESSION_BUFFER",
+        ];
+        let old: Vec<_> = names.iter().map(std::env::var_os).collect();
+        for name in names {
+            std::env::remove_var(name);
+        }
+
+        let c = config_from_env().unwrap();
+        assert_eq!(c.prefetch_pieces, None);
+
+        std::env::set_var("OUTPACE_PREBUFFER_MS", "12000");
+        std::env::set_var("OUTPACE_PREBUFFER_BYTES", "33554432");
+        std::env::set_var("OUTPACE_PREBUFFER_TIMEOUT_MS", "9000");
+        std::env::set_var("OUTPACE_HLS_STARTUP_SEGMENTS", "3");
+        std::env::set_var("OUTPACE_HLS_STARTUP_TIMEOUT_MS", "18000");
+        std::env::set_var("OUTPACE_PREFETCH_PIECES", "32");
+        std::env::set_var("OUTPACE_SESSION_BUFFER", "512");
+        let c = config_from_env().unwrap();
+        assert_eq!(c.startup_buffer.target_ms, 12_000);
+        assert_eq!(c.startup_buffer.max_bytes, 33_554_432);
+        assert_eq!(c.startup_buffer.timeout_ms, 9_000);
+        assert_eq!(c.hls.startup_segments, 3);
+        assert_eq!(c.hls.startup_timeout_ms, 18_000);
+        assert_eq!(c.prefetch_pieces, Some(32));
+        assert_eq!(c.session_buffer, 512);
+
+        std::env::set_var("OUTPACE_PREFETCH_PIECES", "8");
+        assert_eq!(config_from_env().unwrap().prefetch_pieces, Some(8));
+
+        for (name, value) in names.into_iter().zip(old) {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
+    #[test]
+    fn port_mapping_env_overrides_parse_and_default_off() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // Default: no env set -> port mapping is off, backend auto, no external override.
+        std::env::remove_var("OUTPACE_ENABLE_PORT_MAPPING");
+        std::env::remove_var("OUTPACE_PORT_MAP_BACKEND");
+        std::env::remove_var("OUTPACE_PORT_MAP_EXTERNAL_PORT");
+        let c = config_from_env().unwrap();
+        assert!(!c.enable_port_mapping);
+        assert_eq!(c.port_map_backend, ace_swarm::portmap::PortMapBackend::Auto);
+        assert_eq!(c.port_map_external_port, None);
+
+        // Overrides applied.
+        std::env::set_var("OUTPACE_ENABLE_PORT_MAPPING", "1");
+        std::env::set_var("OUTPACE_PORT_MAP_BACKEND", "natpmp");
+        std::env::set_var("OUTPACE_PORT_MAP_EXTERNAL_PORT", "9000");
+        let c = config_from_env().unwrap();
+        assert!(c.enable_port_mapping);
+        assert_eq!(
+            c.port_map_backend,
+            ace_swarm::portmap::PortMapBackend::Natpmp
+        );
+        assert_eq!(c.port_map_external_port, Some(9000));
+
+        std::env::remove_var("OUTPACE_ENABLE_PORT_MAPPING");
+        std::env::remove_var("OUTPACE_PORT_MAP_BACKEND");
+        std::env::remove_var("OUTPACE_PORT_MAP_EXTERNAL_PORT");
+    }
+
+    #[test]
+    fn exposed_boolean_gates_use_one_strict_parser() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _restore = CompatEnvRestore::new();
+        let mut config_errors = Vec::new();
+        let names = [
+            "OUTPACE_ENABLE_SEEDING",
+            "OUTPACE_ENABLE_INBOUND",
+            "OUTPACE_ENABLE_PORT_MAPPING",
+            "OUTPACE_ACE_COMPAT",
+            "OUTPACE_EXPERIMENTAL_ACE_COMPAT",
+            "OUTPACE_BEP9_CONTENT_ID_FALLBACK",
+        ];
+        for name in names {
+            if name == "OUTPACE_ACE_COMPAT" || name == "OUTPACE_EXPERIMENTAL_ACE_COMPAT" {
+                std::env::remove_var("OUTPACE_ACE_COMPAT");
+                std::env::remove_var("OUTPACE_EXPERIMENTAL_ACE_COMPAT");
+            }
+            std::env::remove_var(name);
+            for (value, expected) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+                std::env::set_var(name, value);
+                assert_eq!(
+                    bool_from_env(name).unwrap(),
+                    Some(expected),
+                    "{name}={value}"
+                );
+            }
+            std::env::set_var(name, "ture");
+            match config_from_env() {
+                Ok(_) => config_errors.push(format!("{name} malformed value was accepted")),
+                Err(error) => {
+                    let error = error.to_string();
+                    if !error.contains(name) || !error.contains("expected one of") {
+                        config_errors.push(format!("{name} unexpected error: {error}"));
+                    }
+                }
+            }
+            std::env::remove_var(name);
+        }
+        drop(_restore);
+        drop(_g);
+        assert!(config_errors.is_empty(), "{config_errors:?}");
+    }
+
+    #[tokio::test]
+    async fn mapped_port_replaces_local_port_and_loss_falls_back() {
+        use ace_swarm::portmap::MappedEndpoint;
+        use std::time::Duration;
+
+        const LOCAL: u16 = 8621;
+        const EXTERNAL: u16 = 49152;
+        let (mapped_tx, mapped_rx) = tokio::sync::watch::channel(None);
+        let (announce_tx, mut announce_rx) = tokio::sync::watch::channel(Some(LOCAL));
+        assert_eq!(*announce_rx.borrow(), Some(LOCAL));
+        tokio::spawn(propagate_mapped_announce_port(
+            mapped_rx,
+            announce_tx,
+            LOCAL,
+        ));
+
+        mapped_tx
+            .send(Some(MappedEndpoint {
+                external_ip: None,
+                external_port: EXTERNAL,
+                lease_duration: Duration::from_secs(3600),
+                backend: "test",
+            }))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while *announce_rx.borrow_and_update() != Some(EXTERNAL) {
+                announce_rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(*announce_rx.borrow_and_update(), Some(EXTERNAL));
+
+        drop(mapped_tx);
+        tokio::time::timeout(Duration::from_secs(1), announce_rx.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*announce_rx.borrow(), Some(LOCAL));
+    }
+
+    #[test]
+    fn invalid_port_map_backend_env_is_rejected() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("OUTPACE_PORT_MAP_BACKEND", "bogus");
+        let err = config_from_env().err();
+        std::env::remove_var("OUTPACE_PORT_MAP_BACKEND");
+        assert!(err.is_some(), "invalid backend must be rejected");
+    }
+
+    #[test]
+    fn rejects_zero_session_buffer() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("OUTPACE_SESSION_BUFFER", "0");
+        let err = config_from_env().err();
+        std::env::remove_var("OUTPACE_SESSION_BUFFER");
+        assert!(err.is_some(), "session_buffer=0 must be rejected");
+    }
+
+    #[test]
+    fn admission_config_default_zero_positive_invalid() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let key = "OUTPACE_MAX_SESSIONS";
+        std::env::remove_var(key);
+        assert_eq!(config_from_env().unwrap().max_sessions, 0);
+        for (value, expected) in [("0", 0), ("3", 3)] {
+            std::env::set_var(key, value);
+            assert_eq!(config_from_env().unwrap().max_sessions, expected);
+        }
+        for value in ["-1", "no", "", "999999999999999999999999999999999999999"] {
+            std::env::set_var(key, value);
+            assert!(config_from_env().is_err());
+        }
+        std::env::remove_var(key);
+    }
+
+    #[test]
+    fn default_config_has_live_recovery_and_hls_defaults() {
+        let c = Config::default();
+        assert_eq!(c.live_recovery.request_timeout_ms, 1500);
+        assert_eq!(c.live_recovery.stale_upstream_timeout_ms, 12000);
+        assert_eq!(c.live_recovery.request_check_interval_ms, 1000);
+        assert_eq!(c.live_recovery.max_active_upstreams, 4);
+        assert_eq!(c.live_recovery.max_parallel_connect, 12);
+        assert_eq!(c.live_recovery.max_piece_advance, 256);
+        assert_eq!(c.live_recovery.max_reasm_pieces_ahead, 512);
+        assert_eq!(c.hls.segment_packets, 65_536);
+        assert_eq!(c.hls.window_segments, 8);
+        assert_eq!(c.hls.segment_duration_ms, 5000);
+        assert_eq!(c.hls.startup_segments, 6);
+        assert_eq!(c.hls.startup_timeout_ms, 45_000);
+    }
+
+    #[test]
+    fn parses_live_recovery_and_hls_knobs() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let keys = [
+            "OUTPACE_REQUEST_TIMEOUT_MS",
+            "OUTPACE_STALE_UPSTREAM_TIMEOUT_MS",
+            "OUTPACE_REQUEST_CHECK_INTERVAL_MS",
+            "OUTPACE_MAX_ACTIVE_UPSTREAMS",
+            "OUTPACE_MAX_PARALLEL_CONNECT",
+            "OUTPACE_MAX_PIECE_ADVANCE",
+            "OUTPACE_MAX_REASM_PIECES_AHEAD",
+            "OUTPACE_HLS_SEGMENT_PACKETS",
+            "OUTPACE_HLS_WINDOW_SEGMENTS",
+            "OUTPACE_HLS_SEGMENT_DURATION_MS",
+        ];
+        for key in keys {
+            std::env::remove_var(key);
+        }
+        std::env::set_var("OUTPACE_REQUEST_TIMEOUT_MS", "2500");
+        std::env::set_var("OUTPACE_STALE_UPSTREAM_TIMEOUT_MS", "10000");
+        std::env::set_var("OUTPACE_REQUEST_CHECK_INTERVAL_MS", "500");
+        std::env::set_var("OUTPACE_MAX_ACTIVE_UPSTREAMS", "3");
+        std::env::set_var("OUTPACE_MAX_PARALLEL_CONNECT", "9");
+        std::env::set_var("OUTPACE_MAX_PIECE_ADVANCE", "128");
+        std::env::set_var("OUTPACE_MAX_REASM_PIECES_AHEAD", "256");
+        std::env::set_var("OUTPACE_HLS_SEGMENT_PACKETS", "64");
+        std::env::set_var("OUTPACE_HLS_WINDOW_SEGMENTS", "7");
+        std::env::set_var("OUTPACE_HLS_SEGMENT_DURATION_MS", "1500");
+
+        let c = config_from_env().unwrap();
+
+        assert_eq!(c.live_recovery.request_timeout_ms, 2500);
+        assert_eq!(c.live_recovery.stale_upstream_timeout_ms, 10000);
+        assert_eq!(c.live_recovery.request_check_interval_ms, 500);
+        assert_eq!(c.live_recovery.max_active_upstreams, 3);
+        assert_eq!(c.live_recovery.max_parallel_connect, 9);
+        assert_eq!(c.live_recovery.max_piece_advance, 128);
+        assert_eq!(c.live_recovery.max_reasm_pieces_ahead, 256);
+        assert_eq!(c.hls.segment_packets, 64);
+        assert_eq!(c.hls.window_segments, 7);
+        assert_eq!(c.hls.segment_duration_ms, 1500);
+
+        for key in keys {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_live_recovery_relationships() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("OUTPACE_REQUEST_TIMEOUT_MS", "12000");
+        std::env::set_var("OUTPACE_STALE_UPSTREAM_TIMEOUT_MS", "12000");
+        let err = config_from_env().unwrap_err().to_string();
+        std::env::remove_var("OUTPACE_REQUEST_TIMEOUT_MS");
+        std::env::remove_var("OUTPACE_STALE_UPSTREAM_TIMEOUT_MS");
+        assert!(
+            err.contains("OUTPACE_REQUEST_TIMEOUT_MS must be < OUTPACE_STALE_UPSTREAM_TIMEOUT_MS"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_hls_segment_byte_count_overflow() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("OUTPACE_HLS_SEGMENT_PACKETS", usize::MAX.to_string());
+        let err = config_from_env().unwrap_err().to_string();
+        std::env::remove_var("OUTPACE_HLS_SEGMENT_PACKETS");
+        assert!(
+            err.contains("OUTPACE_HLS_SEGMENT_PACKETS")
+                && (err.contains("byte count overflows") || err.contains("object limit")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parses_cache_type_and_dir() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("OUTPACE_CACHE_TYPE", "disk");
+        std::env::set_var("OUTPACE_CACHE_DIR", "/tmp/outpace-cache-test");
+        let c = config_from_env().unwrap();
+        assert_eq!(c.cache_type, CacheType::Disk);
+        assert_eq!(
+            c.cache_dir,
+            std::path::PathBuf::from("/tmp/outpace-cache-test")
+        );
+        std::env::remove_var("OUTPACE_CACHE_TYPE");
+        std::env::remove_var("OUTPACE_CACHE_DIR");
+    }
+
+    #[test]
+    fn rejects_invalid_cache_type() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("OUTPACE_CACHE_TYPE", "nvme");
+        let err = config_from_env().err();
+        std::env::remove_var("OUTPACE_CACHE_TYPE");
+        assert!(err.is_some(), "unknown cache type must be rejected");
+    }
+
+    #[test]
+    fn disk_cache_may_be_nested_under_data_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "outpace-safe-cache-paths-{}",
+            rand::random::<u64>()
+        ));
+        let mut config = Config {
+            data_dir: root.clone(),
+            cache_type: CacheType::Disk,
+            cache_dir: root.join("state/../cache"),
+            ..Config::default()
+        };
+        prepare_disk_cache_paths(&mut config).unwrap();
+        assert!(config.cache_dir.starts_with(&config.data_dir));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn disk_cache_equal_to_data_dir_is_rejected_before_cleanup() {
+        let root = std::env::temp_dir().join(format!(
+            "outpace-cache-equals-data-{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join("persistent-state");
+        std::fs::write(&marker, b"keep").unwrap();
+        let config = Config {
+            data_dir: root.clone(),
+            cache_type: CacheType::Disk,
+            cache_dir: root.clone(),
+            enable_inbound: false,
+            ..Config::default()
+        };
+
+        let error = build_runtime(config, vec![])
+            .await
+            .err()
+            .expect("equal cache/data paths must fail")
+            .to_string();
+        assert!(
+            error.contains("must not equal or contain"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            marker.exists(),
+            "validation must run before destructive cache cleanup"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn disk_cache_ancestor_of_data_dir_is_rejected_before_cleanup() {
+        let root = std::env::temp_dir().join(format!(
+            "outpace-cache-contains-data-{}",
+            rand::random::<u64>()
+        ));
+        let data_dir = root.join("persistent");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let marker = data_dir.join("identity-and-broadcast-state");
+        std::fs::write(&marker, b"keep").unwrap();
+        let config = Config {
+            data_dir,
+            cache_type: CacheType::Disk,
+            cache_dir: root.clone(),
+            enable_inbound: false,
+            ..Config::default()
+        };
+
+        let error = build_runtime(config, vec![])
+            .await
+            .err()
+            .expect("a cache containing the data directory must fail")
+            .to_string();
+        assert!(
+            error.contains("must not equal or contain"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            marker.exists(),
+            "validation must run before destructive cache cleanup"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_sensitive_parent_path_cannot_bypass_cache_guard() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "outpace-cache-symlink-parent-{}",
+            rand::random::<u64>()
+        ));
+        let a = root.join("a");
+        let b = root.join("b");
+        let symlink_target = b.join("sub");
+        let data_dir = b.join("state");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&symlink_target).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        symlink(&symlink_target, a.join("link")).unwrap();
+        let marker = data_dir.join("MUST_SURVIVE");
+        std::fs::write(&marker, b"persistent state").unwrap();
+
+        let config = Config {
+            data_dir,
+            cache_type: CacheType::Disk,
+            // Filesystem resolution is `<target-of-link>/..` = `b`, not lexical `a`.
+            cache_dir: a.join("link/.."),
+            enable_inbound: false,
+            ..Config::default()
+        };
+
+        let error = build_runtime(config, vec![])
+            .await
+            .err()
+            .expect("symlink-sensitive cache ancestor must fail")
+            .to_string();
+        assert!(
+            error.contains("must not equal or contain"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            marker.exists(),
+            "validated cache path and deleted path must have identical filesystem semantics"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn disk_cache_sibling_of_data_dir_does_not_wipe_unrelated_contents() {
+        let root =
+            std::env::temp_dir().join(format!("outpace-cache-sibling-{}", rand::random::<u64>()));
+        let data_dir = root.join("data");
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let canary = cache_dir.join("MUST_SURVIVE");
+        std::fs::write(&canary, b"unrelated").unwrap();
+
+        let config = Config {
+            data_dir,
+            cache_type: CacheType::Disk,
+            cache_dir: cache_dir.clone(),
+            enable_inbound: false,
+            ..Config::default()
+        };
+
+        let result = build_runtime(config, vec![]).await;
+        assert!(
+            canary.exists(),
+            "disk cache cleanup must not wipe a sibling directory's unrelated contents"
+        );
+        let error = result
+            .err()
+            .expect("an unmarked cache directory must not be wiped")
+            .to_string();
+        assert!(
+            error.contains("dedicated Outpace cache") || error.contains(".outpace-cache"),
+            "unexpected error: {error}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn disk_cache_fresh_empty_dir_is_marked_and_starts() {
+        let root =
+            std::env::temp_dir().join(format!("outpace-cache-fresh-{}", rand::random::<u64>()));
+        let data_dir = root.join("data");
+        let cache_dir = data_dir.join("cache");
+        let config = Config {
+            data_dir,
+            cache_type: CacheType::Disk,
+            cache_dir: cache_dir.clone(),
+            enable_inbound: false,
+            ..Config::default()
+        };
+
+        build_runtime(config, vec![])
+            .await
+            .expect("a fresh empty cache directory must start");
+        assert!(
+            cache_dir.join(".outpace-cache").is_file(),
+            "first startup must mark the cache so later wipes are allowed"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disk_cache_symlink_sentinel_does_not_authorize_wipe() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "outpace-cache-linked-marker-{}",
+            rand::random::<u64>()
+        ));
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let canary = cache_dir.join("MUST_SURVIVE");
+        std::fs::write(&canary, b"unrelated").unwrap();
+        let link_target = root.join("external-file");
+        std::fs::write(&link_target, b"external data").unwrap();
+        symlink(&link_target, cache_dir.join(DISK_CACHE_SENTINEL)).unwrap();
+
+        let config = Config {
+            data_dir: root.join("data"),
+            cache_type: CacheType::Disk,
+            cache_dir,
+            enable_inbound: false,
+            ..Config::default()
+        };
+        let result = build_runtime(config, vec![]).await;
+        let canary_bytes = std::fs::read(canary).ok();
+        let target_bytes = std::fs::read(link_target).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+
+        assert_eq!(
+            canary_bytes.as_deref(),
+            Some(b"unrelated".as_slice()),
+            "a linked sentinel must not authorize deleting unrelated contents"
+        );
+        assert_eq!(target_bytes, b"external data");
+        let error = result
+            .err()
+            .expect("a symlink sentinel must be rejected")
+            .to_string();
+        assert!(error.contains("dedicated Outpace cache"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn disk_cache_with_sentinel_still_wipes_leftover_files() {
+        let root =
+            std::env::temp_dir().join(format!("outpace-cache-marked-{}", rand::random::<u64>()));
+        let data_dir = root.join("data");
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        // Operators may explicitly dedicate an existing cache using an empty regular marker.
+        std::fs::write(cache_dir.join(".outpace-cache"), b"").unwrap();
+        let leftover = cache_dir.join("orphan");
+        std::fs::write(&leftover, b"stale").unwrap();
+
+        let config = Config {
+            data_dir,
+            cache_type: CacheType::Disk,
+            cache_dir: cache_dir.clone(),
+            enable_inbound: false,
+            ..Config::default()
+        };
+
+        build_runtime(config, vec![])
+            .await
+            .expect("a marked cache directory must still be wipeable");
+        assert!(
+            !leftover.exists(),
+            "a dedicated cache must still be cleared at startup"
+        );
+        assert!(
+            cache_dir.join(".outpace-cache").is_file(),
+            "the sentinel must be rewritten after the wipe"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn simulated_32_bit_memory_cache_enforces_conservative_boundary() {
+        let object_limit = i32::MAX as u64;
+        let safe_limit = safe_in_memory_pool_limit(object_limit);
+        let mut config = Config {
+            cache_type: CacheType::Memory,
+            seed_store_bytes: safe_limit,
+            ..Config::default()
+        };
+        validate_cache_budget_for_object_limit(&config, object_limit).unwrap();
+
+        config.seed_store_bytes = safe_limit + 1;
+        let err = validate_cache_budget_for_object_limit(&config, object_limit).unwrap_err();
+        assert!(
+            err.contains("OUTPACE_SEED_STORE_BYTES"),
+            "unexpected error: {err}"
+        );
+
+        config.cache_type = CacheType::Disk;
+        config.seed_store_bytes = u64::MAX;
+        validate_cache_budget_for_object_limit(&config, object_limit).unwrap();
+    }
+
+    #[tokio::test]
+    async fn build_runtime_reloads_persisted_broadcasts_and_serves_them() {
+        use crate::broadcast::BroadcastRegistry;
+
+        let data_dir =
+            std::env::temp_dir().join(format!("outpace-rt-test-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        // Mint a broadcast under this data_dir with a throwaway registry (writes the record),
+        // capturing its identity, then drop the registry to simulate a shutdown.
+        let infohash = {
+            let seed = ace_swarm::listen::SeedRegistry::new();
+            let reg = BroadcastRegistry::with_persist(
+                &data_dir,
+                CacheType::Memory,
+                std::path::PathBuf::new(),
+            );
+            let bc = reg.mint("news", &[], &seed, 1 << 20).await.unwrap();
+            bc.infohash
+        };
+
+        // A fresh daemon start over the same data_dir must reload it and serve it.
+        // `enable_inbound` off keeps the reload path offline — this test covers reload+serve,
+        // not the (network) self-announce that a reloaded broadcast would otherwise spawn.
+        let config = Config {
+            data_dir: data_dir.clone(),
+            networks: vec![],
+            enable_inbound: false,
+            ..Config::default()
+        };
+        let runtime = build_runtime(config, vec![]).await.unwrap();
+
+        let reloaded = runtime.broadcasts.registry.get("news").await;
+        assert!(
+            reloaded.is_some(),
+            "persisted broadcast reloaded into the registry"
+        );
+        assert_eq!(
+            reloaded.unwrap().infohash,
+            infohash,
+            "identity survives restart"
+        );
+        assert!(
+            runtime.seed_registry.serves(&infohash),
+            "reloaded broadcast is immediately servable"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn build_runtime_wires_max_unchoked_without_error() {
+        let dir = std::env::temp_dir().join(format!("outpace-rt-mu-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = Config {
+            data_dir: dir.clone(),
+            cache_dir: dir.join("cache"),
+            max_unchoked: 2,
+            enable_inbound: true,
+            bind: "127.0.0.1:0".parse().unwrap(),
+            peer_listen: "127.0.0.1:0".parse().unwrap(),
+            rtmp_bind: "127.0.0.1:0".parse().unwrap(),
+            ..Config::default()
+        };
+        let runtime = build_runtime(config, vec![]).await.unwrap();
+        assert_eq!(runtime.config.max_unchoked, 2);
+        assert!(
+            runtime.reachability.is_some(),
+            "a reachability monitor exists when inbound serving is on"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn reachability_monitor_is_absent_when_inbound_is_disabled() {
+        // Issue #22 task 5: with inbound serving off we can never be dialed, so the whole
+        // reachability feature must be inert — no monitor is created, nothing harvests `yourip`
+        // or counts inbound peers, and the status logger never runs.
+        let dir = std::env::temp_dir().join(format!("outpace-rt-reach-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = Config {
+            data_dir: dir.clone(),
+            cache_dir: dir.join("cache"),
+            networks: vec![],
+            enable_inbound: false,
+            bind: "127.0.0.1:0".parse().unwrap(),
+            peer_listen: "127.0.0.1:0".parse().unwrap(),
+            rtmp_bind: "127.0.0.1:0".parse().unwrap(),
+            ..Config::default()
+        };
+        let runtime = build_runtime(config, vec![]).await.unwrap();
+        assert!(
+            runtime.reachability.is_none(),
+            "no reachability monitor when inbound serving is disabled"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod tests_options51;
+#[cfg(test)]
+mod tests_pull206;
+
+#[cfg(test)]
+mod inbound_policy_tests;
