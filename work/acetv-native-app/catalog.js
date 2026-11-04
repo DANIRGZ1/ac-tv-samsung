@@ -3,7 +3,7 @@
 var root, active=false, full=false, xhr=null, request=0, page=0, total=0;
 var rows=[], items=[], sourceItems=[], cachedItems=[], localResults=[], index=0, query='', sport=false, onlyFavorites=false;
 var homeMode=true,genre='';
-function addChannel(name,value,authorized){if(authorized!==true)return {ok:false,message:'Confirma que tienes autorización para reproducir esta emisión.'};var parsed=AceCore.parse(String(value||'').trim()),title=cleanText(name,120).trim();if(!parsed||!title)return {ok:false,message:'Escribe un nombre y un enlace Ace Stream compatible.'};var existing=cachedItems.find(function(i){return i.id===parsed.id;});if(existing){if((existing.kind||'infohash')!==parsed.kind)return {ok:false,message:'Este identificador ya existe con otro tipo de enlace. No se ha guardado ni cambiado el canal anterior.'};return {ok:true,message:'Este enlace ya está guardado.'};}if(cachedItems.length>=CHANNEL_CACHE_LIMIT)return {ok:false,message:'La lista de canales está llena.'};var item={id:parsed.id,name:title,kind:parsed.kind};var previous=cachedItems;cachedItems=normalizeChannels(cachedItems.concat([item]));if(!persistChannels()){cachedItems=previous;return {ok:false,message:'No se ha podido guardar el canal. Comprueba el espacio disponible.'};}return {ok:true,message:'Canal guardado en esta TV.'};}
+function addChannel(name,value){var parsed=AceCore.parse(String(value||'').trim()),title=cleanText(name,120).trim();if(!parsed||!title)return {ok:false,message:'Escribe un nombre y un enlace Ace Stream compatible.'};var existing=cachedItems.find(function(i){return i.id===parsed.id;});if(existing){if((existing.kind||'infohash')!==parsed.kind)return {ok:false,message:'Este identificador ya existe con otro tipo de enlace. No se ha guardado ni cambiado el canal anterior.'};return {ok:true,message:'Este enlace ya está guardado.'};}if(cachedItems.length>=CHANNEL_CACHE_LIMIT)return {ok:false,message:'La lista de canales está llena.'};var item={id:parsed.id,name:title,kind:parsed.kind};var previous=cachedItems;cachedItems=normalizeChannels(cachedItems.concat([item]));if(!persistChannels()){cachedItems=previous;return {ok:false,message:'No se ha podido guardar el canal. Comprueba el espacio disponible.'};}return {ok:true,message:'Canal guardado en esta TV.'};}
 
 var current=null, favorites=[], zapTimer=null, lastSection='guide-home';
 try { favorites=FavoritesCore.normalize(JSON.parse(localStorage.getItem('ace-tv.favorites')||'[]')); } catch(e) {}
@@ -165,7 +165,7 @@ function zap(delta) {
 }
 function options() {
   active=false;cancelRequest();clearTimeout(zapTimer);full=false;
-  AceTV.stop('Añade únicamente emisiones propias o cuya reproducción esté autorizada.');root.hidden=true;
+  AceTV.stop('Añade un nombre y un enlace para guardar tu canal.');root.hidden=true;
   document.body.classList.remove('guide-active');size();$('source').focus();
 }
 function sidebar(){return ['guide-home','guide-live','guide-sport','guide-favorites','guide-search','guide-reload','guide-options'];}

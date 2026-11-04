@@ -34,9 +34,9 @@ Las imágenes que muestran canales usan nombres genéricos. No contienen logos d
 
 ## Primer uso y enlaces propios
 
-La bienvenida informa de que no se incluyen canales y explica la responsabilidad del usuario.
+La guía rápida es opcional y explica cómo añadir un canal. No hay una pantalla de aceptación obligatoria.
 
-![Uso responsable](images/onboarding-welcome.png)
+![Guía rápida opcional](images/onboarding-welcome.png)
 
 El formulario permite guardar un enlace propio con un nombre. No contiene enlaces precargados.
 
