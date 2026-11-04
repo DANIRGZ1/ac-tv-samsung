@@ -1,6 +1,6 @@
 (function(){'use strict';
 var $=function(id){return document.getElementById(id)},av=window.webapis&&webapis.avplay,serial=0,requests=[],command=null,phase='idle',watchdog=null,hudTimer=null,origin=null,viewport={left:0,top:0,width:1920,height:1080};
-var fields=[$('engine'),$('source'),$('play'),$('explore'),$('check'),$('import-pc'),$('stop'),$('backguide')];
+var fields=[$('engine'),$('source'),$('play'),$('explore'),$('check'),$('import-pc'),$('stop'),$('backguide'),$('setup')];
 var recoveryAttempts=0,totalRecoveries=0,recoveryTimer=null,recovering=false,displayTimer=null,playbackMonitorTimer=null,playbackMonitorStatus='idle',playbackLastTime=null,playbackLastSampleAt=0,playbackLastAdvanceAt=0,playbackHealthyMs=0;
 function readAvPlaybackTime(){try{if(av&&typeof av.getCurrentTime==='function'){var value=av.getCurrentTime();return typeof value==='number'&&isFinite(value)&&value>=0?value:null;}}catch(e){}return null;}
 function clearPlaybackMonitor(state){clearTimeout(playbackMonitorTimer);playbackMonitorTimer=null;playbackLastTime=null;playbackLastSampleAt=0;playbackLastAdvanceAt=0;playbackHealthyMs=0;if(state)playbackMonitorStatus=state;}

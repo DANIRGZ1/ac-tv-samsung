@@ -123,7 +123,7 @@ function submitSearch() {
   page=0; onlyFavorites=false; sport=false; lastSection='guide-home';
   $('guide-query').blur(); searchVisible(false); $('guide-search').focus(); load();
 }
-function load(forceRemote, useEngine) {
+function load(forceRemote, useEngine, completed) {
   clearTimeout(zapTimer); cancelRequest();
   if(onlyFavorites){render(null,'guide-favorites');status(items.length?'Selecciona un favorito y pulsa OK para verlo.':'Añade tus primeros canales a Mis favoritos.');return;}
   var token=request,typing=!$('guide-searchbox').hidden?document.activeElement.id:null;
@@ -140,7 +140,7 @@ function load(forceRemote, useEngine) {
   heading();details();root.setAttribute('aria-busy','true');status('Importando catálogo completo desde Ace Stream…');
   function restore(text){
     if(token!==request)return;
-    xhr=null;root.setAttribute('aria-busy','false');page=0;localResults=cachedItems.filter(function(item){var match=matchesName(item.name,query);return match&&categoryMatches(item);});total=localResults.length;sourceItems=localResults.slice(0,50);index=0;render(null,typing);status(text+' Se conserva el catálogo guardado en la TV.');
+    xhr=null;root.setAttribute('aria-busy','false');page=0;localResults=cachedItems.filter(function(item){var match=matchesName(item.name,query);return match&&categoryMatches(item);});total=localResults.length;sourceItems=localResults.slice(0,50);index=0;render(null,typing);status(text+' Se conserva el catálogo guardado en la TV.');if(completed)completed(text);
   }
   function finish(){
     if(token!==request)return;
@@ -150,7 +150,7 @@ function load(forceRemote, useEngine) {
     if(!persistChannels()){cachedItems=previousCache;restore('No se pudo guardar el catálogo. Comprueba el espacio disponible.');return;}
     localResults=cachedItems.filter(function(item){var match=matchesName(item.name,query);return match&&categoryMatches(item);});
     total=localResults.length;page=0;sourceItems=localResults.slice(0,50);index=0;root.setAttribute('aria-busy','false');render(null,typing);
-    status('Catálogo actualizado: '+imported.length+' canales importados y guardados en la TV.');
+    status('Catálogo actualizado: '+imported.length+' canales importados y guardados en la TV.');if(completed)completed(null,{channels:cachedItems.length});
   }
   function fetchPage(){
     if(token!==request)return;
@@ -187,14 +187,14 @@ function section(name){searchVisible(false);$('guide-query').blur();query='';gen
 function toggleFavorite(override) {
   var item=override&&typeof override.id==='string'?override:items[index];if(!item)return;
   var had=saved(item.id), next=FavoritesCore.toggle(favorites,item);
-  if(!had&&next.length===favorites.length){status('Puedes guardar hasta 100 canales. Quita alguno antes de añadir otro.');if(full&&AceTV.notify)AceTV.notify('Tu lista de favoritos está llena. Quita un canal para añadir otro.');return;}
+  if(!had&&next.length===favorites.length){status('Puedes guardar hasta 100 canales. Quita alguno antes de añadir otro.');if(full&&AceTV.notify)AceTV.notify('Tu lista de favoritos está llena. Quita un canal para añadir otro.');return false;}
   try{localStorage.setItem('ace-tv.favorites',JSON.stringify(next));}
-  catch(e){status('No se han podido guardar los favoritos. Inténtalo otra vez.');if(full&&AceTV.notify)AceTV.notify('No se han podido guardar los favoritos. Inténtalo otra vez.');return;}
+  catch(e){status('No se han podido guardar los favoritos. Inténtalo otra vez.');if(full&&AceTV.notify)AceTV.notify('No se han podido guardar los favoritos. Inténtalo otra vez.');return false;}
   favorites=next;
   var focus=document.activeElement&&document.activeElement.id;
   render(item.id,focus==='guide-star'?'guide-star':null);
   var message=had?'Quitado de Mis favoritos: '+item.name:'Añadido a Mis favoritos: '+item.name;status(message);if(full&&AceTV.notify)AceTV.notify(message);
-  if(!items.length)$('guide-empty-search').focus();
+  if(!items.length)$('guide-empty-search').focus();return true;
 }
 function play(force) {
   var item=items[index];if(!item)return;
@@ -262,6 +262,6 @@ if($('import-pc'))$('import-pc').onclick=function(){open();load(true,true)};
 $('explore').onclick=open;$('backguide').onclick=open;
 document.addEventListener('visibilitychange',function(){if(document.hidden){clearTimeout(zapTimer);cancelRequest();}else if(active){fullscreen(false);if(!items.length)load();}});
 window.AceGuide={preparePlayback:function(){if(active&&current)fullscreen(true);},currentName:function(){return current?current.name:"Tu canal";},open:open,status:status,onPlayer:playerPhase,isPreview:function(){return false;}};
-window.AceCatalog={open:open,close:options,search:function(text){open();$('guide-query').value=String(text).slice(0,80);submitSearch();},diagnostics:function(){return {open:active,fullscreen:full,loading:!!xhr,page:page,items:items.length,cachedChannels:cachedItems.length,favorites:favorites.length,index:index,current:!!current,section:homeMode?'home':onlyFavorites?'favorites':sport?'sport':query?'search':genre||'live'};}};
+window.AceCatalog={refresh:function(done){onlyFavorites=false;query='';genre='';sport=false;page=0;load(true,false,done);},cancelRefresh:function(){cancelRequest();load();},suggestions:function(){var preferred=cachedItems.filter(function(i){return /^(dazn|m[. +]|movistar|eurosport|la [12]|antena|telecinco|lasexta|cuatro|24h)/i.test(i.name);});return normalizeChannels(favorites.concat(preferred,cachedItems)).slice(0,18).map(function(i){return {id:i.id,name:i.name};});},isFavorite:saved,toggleFavorite:function(id){var item=cachedItems.find(function(i){return i.id===id;});return item?toggleFavorite(item):false;},finishSetup:function(search){open();section(favorites.length?'guide-home':'guide-live');if(search)showSearch();},open:open,close:options,search:function(text){open();$('guide-query').value=String(text).slice(0,80);submitSearch();},diagnostics:function(){return {open:active,fullscreen:full,loading:!!xhr,page:page,items:items.length,cachedChannels:cachedItems.length,favorites:favorites.length,index:index,current:!!current,section:homeMode?'home':onlyFavorites?'favorites':sport?'sport':query?'search':genre||'live'};}};
 open();
 }());

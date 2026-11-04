@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/DANIRGZ1/ac-tv-samsung/actions/workflows/tests.yml"><img alt="Pruebas automáticas" src="https://github.com/DANIRGZ1/ac-tv-samsung/actions/workflows/tests.yml/badge.svg"></a>
-  <img alt="Versión 0.9.0" src="https://img.shields.io/badge/versi%C3%B3n-0.9.0-a0ff32?labelColor=182016">
+  <img alt="Versión 0.10.0" src="https://img.shields.io/badge/versi%C3%B3n-0.10.0-a0ff32?labelColor=182016">
   <img alt="Tizen 6.5 comprobado" src="https://img.shields.io/badge/Tizen-6.5_comprobado-91b8df?labelColor=182016">
   <a href="LICENSE"><img alt="Licencia AGPL 3.0" src="https://img.shields.io/badge/licencia-AGPL--3.0-cccccc?labelColor=182016"></a>
 </p>
@@ -53,6 +53,14 @@ AC TV reúne el catálogo, tus favoritos y el reproductor en una interfaz pensad
 
 *Interfaz real renderizada en Chromium con datos sintéticos. La portada es una composición gráfica de esa interfaz; las capturas no son fotografías de una TV ni una prueba de disponibilidad de las emisiones. No muestran listas personales ni identificadores reales de contenido del usuario.*
 
+## Primer arranque guiado
+
+Al abrir una instalación vacía, AC TV te da la bienvenida, prepara el catálogo y te deja marcar tus primeros favoritos con OK. Puedes cancelar, reintentar o elegirlos después. Las instalaciones con canales guardados conservan sus datos y no muestran esta guía automáticamente. Puedes volver a abrirla desde **Ajustes → Guía de inicio**.
+
+![Bienvenida de AC TV](docs/images/onboarding-welcome.png)
+
+![Elegir los primeros favoritos](docs/images/onboarding-favorites.png)
+
 ## Tu mando es suficiente
 
 | Botón | Acción |
@@ -65,11 +73,22 @@ AC TV reúne el catálogo, tus favoritos y el reproductor en una interfaz pensad
 
 ## Estado y compatibilidad
 
-**0.9.0 · Samsung UE50BU8500KXXC · Tizen 6.5 / Chromium 85.** El encuadre, la reproducción nativa, los logos y el control con mando se comprobaron en ese equipo. Otros televisores y versiones de Tizen no están verificados.
+**0.10.0 · Samsung UE50BU8500KXXC · Tizen 6.5 / Chromium 85.** El encuadre, la reproducción nativa, los logos y el control con mando se comprobaron en ese equipo. Otros televisores y versiones de Tizen no están verificados.
 
 El catálogo y los favoritos se guardan en la TV. El refresco consulta el buscador público de Ace Stream; ese servicio puede cambiar. La disponibilidad y la calidad de cada emisión dependen de sus fuentes. No se distribuye una lista personal de canales ni enlaces de contenido. AC TV es un proyecto independiente y no está afiliado con Samsung, Ace Stream ni las cadenas.
 
 ## Instalar en tu propia TV
+
+Sigue la [guía paso a paso](docs/INSTALL.md). El nuevo ayudante comprueba las herramientas sin conectarse a la TV; solo firma e instala cuando añades `-Install`.
+
+```powershell
+# Comprobar primero, sin modificar la TV:
+pwsh -File scripts/install-tv.ps1 -TvIp 192.168.1.42 -SecurityProfile MiPerfilTV
+# Firmar con tu perfil e instalar:
+pwsh -File scripts/install-tv.ps1 -TvIp 192.168.1.42 -SecurityProfile MiPerfilTV -Install -Launch
+```
+
+### Empaquetado manual
 
 Necesitas Tizen Studio, Samsung TV Extension, Samsung Certificate Extension y un perfil de firma propio que incluya el dispositivo de destino. Activa el modo desarrollador de la TV y conéctala con las herramientas del SDK.
 
