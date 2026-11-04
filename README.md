@@ -1,25 +1,73 @@
-# AC TV para Samsung
+<p align="center">
+  <img src="docs/images/cover.png" alt="AC TV: tus canales en tu Samsung. Motor integrado y navegación con mando." width="100%">
+</p>
 
-Reproductor experimental para televisores Samsung Tizen, con motor P2P ejecutado en la propia TV y reproducción nativa mediante AVPlay. Una vez instalada, la reproducción no necesita Ace Stream abierto en el ordenador.
+<h1 align="center">AC TV para Samsung</h1>
 
-![Inicio de AC TV](docs/images/home.png)
+<p align="center"><strong>Busca un canal. Guárdalo en favoritos. Dale al play desde el sofá.</strong></p>
 
-## Qué incluye
+<p align="center">Reproductor para Samsung Tizen con motor P2P integrado y vídeo nativo mediante AVPlay.<br>Una vez instalada, no necesitas mantener Ace Stream abierto en el ordenador.</p>
 
-- Portada, favoritos y categorías con navegación por mando.
-- Búsqueda por nombre sobre el catálogo guardado en la TV; actualización directa desde el buscador público de Ace Stream.
-- Selección redondeada con animación suave y soporte de movimiento reducido.
-- Logos locales para 59 variantes de canales; nombre legible cuando no hay un logo adecuado.
-- Pantalla «Cargando canal…», cancelación con Atrás y recuperación automática de interrupciones.
-- Nombre del canal y controles durante la reproducción. Botón amarillo para añadir o quitar favoritos, incluso mientras ves el canal.
+<p align="center">
+  <a href="https://github.com/DANIRGZ1/ac-tv-samsung/actions/workflows/tests.yml"><img alt="Pruebas automáticas" src="https://github.com/DANIRGZ1/ac-tv-samsung/actions/workflows/tests.yml/badge.svg"></a>
+  <img alt="Versión 0.9.0" src="https://img.shields.io/badge/versi%C3%B3n-0.9.0-a0ff32?labelColor=182016">
+  <img alt="Tizen 6.5 comprobado" src="https://img.shields.io/badge/Tizen-6.5_comprobado-91b8df?labelColor=182016">
+  <a href="LICENSE"><img alt="Licencia AGPL 3.0" src="https://img.shields.io/badge/licencia-AGPL--3.0-cccccc?labelColor=182016"></a>
+</p>
 
-Las capturas son vistas de la interfaz renderizada en Chromium con datos de demostración. No incluyen listas personales ni identificadores reales de contenido del usuario.
+<p align="center"><a href="#galería">Galería</a> · <a href="#instalar-en-tu-propia-tv">Instalación</a> · <a href="#tu-mando-es-suficiente">Controles</a> · <a href="#estado-y-compatibilidad">Compatibilidad</a> · <a href="CONTRIBUTING.md">Contribuir</a></p>
+
+> **Experimental · Instalación en modo desarrollador.** Comprobada en un Samsung con Tizen 6.5. No está publicada en Samsung Apps; la compatibilidad con otros modelos aún debe verificarse.
+
+## Tu televisión, a tu manera
+
+AC TV reúne el catálogo, tus favoritos y el reproductor en una interfaz pensada para una pantalla grande. Busca por nombre, explora categorías y elige con las flechas del mando. La conexión se gestiona por dentro: mientras abre la emisión, solo ves el nombre del canal y «Cargando canal…».
+
+| Función | Qué te aporta |
+| --- | --- |
+| **Motor en la propia Samsung** | Reproducción P2P con AVPlay sin mantener un motor abierto en el PC. |
+| **Favoritos a un toque** | Tus canales a mano; añade o quita favoritos con el botón amarillo, también mientras ves uno. |
+| **Búsqueda por nombre** | Busca en el catálogo guardado en la TV, con coincidencias flexibles de nombres y marcas. |
+| **Una interfaz para el mando** | Tarjetas grandes, foco redondeado, animación suave y categorías. |
+| **Logos guardados en la app** | 59 variantes locales; nombre legible si no existe una correspondencia exacta. |
+| **Carga y recuperación sencillas** | Cancelación con Atrás, reintentos automáticos y opciones claras si el canal falla. |
+
+## Galería
+
+### Una portada con tus favoritos
+
+![Inicio: favoritos y categorías](docs/images/home.png)
+
+<table>
+<tr>
+<td width="50%"><strong>Explora los canales</strong><br><br><img src="docs/images/channels.png" alt="Catálogo de canales con logos y foco de selección" width="100%"></td>
+<td width="50%"><strong>Tus favoritos, juntos</strong><br><br><img src="docs/images/favorites.png" alt="Sección Mis favoritos con cuatro canales de demostración" width="100%"></td>
+</tr>
+<tr>
+<td width="50%"><strong>Encuentra el canal por su nombre</strong><br><br><img src="docs/images/search-results.png" alt="Resultados de búsqueda para DAZN" width="100%"></td>
+<td width="50%"><strong>Elige y deja que cargue</strong><br><br><img src="docs/images/loading.png" alt="Pantalla sencilla Cargando canal con el nombre de la emisión" width="100%"></td>
+</tr>
+</table>
+
+[Ver todas las capturas a tamaño completo →](docs/GALLERY.md)
+
+*Interfaz real renderizada en Chromium con datos sintéticos. La portada es una composición gráfica de esa interfaz; las capturas no son fotografías de una TV ni una prueba de disponibilidad de las emisiones. No muestran listas personales ni identificadores reales de contenido del usuario.*
+
+## Tu mando es suficiente
+
+| Botón | Acción |
+| --- | --- |
+| **Flechas** | Recorrer tarjetas, secciones y categorías. |
+| **OK** | Elegir un canal; durante el vídeo, pausar o reanudar. |
+| **Amarillo** | Añadir o quitar el canal de favoritos. |
+| **CH+ / CH−** | Cambiar de canal. |
+| **Atrás** | Cancelar la carga o volver al catálogo durante la reproducción. |
 
 ## Estado y compatibilidad
 
-Versión 0.9.0. Comprobada en un Samsung UE50BU8500KXXC con Tizen 6.5 / Chromium 85. Otros modelos y versiones de Tizen no están verificados. Es una aplicación experimental para instalar mediante modo desarrollador; no está publicada en Samsung Apps y no es una aplicación oficial de Ace Stream, Samsung ni de las cadenas.
+**0.9.0 · Samsung UE50BU8500KXXC · Tizen 6.5 / Chromium 85.** El encuadre, la reproducción nativa, los logos y el control con mando se comprobaron en ese equipo. Otros televisores y versiones de Tizen no están verificados.
 
-El catálogo y los favoritos se almacenan en la TV. No se distribuye una lista personal de canales ni enlaces de contenido. La disponibilidad de las emisiones depende de sus fuentes. El refresco del catálogo usa un servicio público que puede cambiar.
+El catálogo y los favoritos se guardan en la TV. El refresco consulta el buscador público de Ace Stream; ese servicio puede cambiar. La disponibilidad y la calidad de cada emisión dependen de sus fuentes. No se distribuye una lista personal de canales ni enlaces de contenido. AC TV es un proyecto independiente y no está afiliado con Samsung, Ace Stream ni las cadenas.
 
 ## Instalar en tu propia TV
 
@@ -66,3 +114,15 @@ Los runtimes generados incluidos permiten empaquetar la aplicación sin recompil
 Código AC TV y componentes de Outpace: **AGPL-3.0-or-later**; consulta [LICENSE](LICENSE), los avisos `NOTICE.txt` y las licencias upstream. Outpace: [jamezrin/outpace](https://github.com/jamezrin/outpace), revisión `dba774d870e08d2778748196e145455c74f22152`.
 
 Los logos identifican a sus respectivas cadenas y pertenecen a sus titulares; no implican afiliación. Se obtuvieron de [tv-logo/tv-logos](https://github.com/tv-logo/tv-logos); procedencia individual en `work/acetv-native-app/assets/logos/SOURCES.json`. No se presentan como creación propia ni como recursos licenciados bajo AGPL. Fondos de estadio y categorías generados para este proyecto; descripción en [recursos visuales](docs/ASSETS.md).
+
+
+## ¿Quieres ayudar?
+
+Si lo pruebas en otro modelo, [abre una incidencia](https://github.com/DANIRGZ1/ac-tv-samsung/issues/new) indicando modelo, versión de Tizen, comportamiento esperado y lo que ocurrió. También son bienvenidas mejoras de interfaz, accesibilidad y documentación. Consulta [CONTRIBUTING.md](CONTRIBUTING.md).
+
+<details>
+<summary><strong>English overview</strong></summary>
+
+AC TV is an experimental Samsung Tizen TV player with an integrated TV-local P2P engine, native AVPlay playback, remote-friendly navigation, favorites, channel search and bundled channel logos. Playback does not require keeping Ace Stream running on a PC after installation. Tested on one Samsung Tizen 6.5 television; other models are unverified. Developer-mode installation and your own Samsung signing certificates are required. Source code is available under AGPL-3.0-or-later. Screenshots use synthetic demonstration data.
+
+</details>
