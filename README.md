@@ -4,11 +4,11 @@
 <p align="center"><strong>Añade tus enlaces. Guarda tus canales. Reproduce con el mando.</strong></p>
 <p align="center">Reproductor experimental para Samsung Tizen con motor P2P integrado y vídeo nativo AVPlay.</p>
 
-<p align="center"><img alt="Versión 0.11.1" src="https://img.shields.io/badge/versi%C3%B3n-0.11.1-a0ff32?labelColor=182016"> <img alt="Tizen 6.5 base comprobada" src="https://img.shields.io/badge/Tizen-6.5_base_comprobada-91b8df?labelColor=182016"> <a href="LICENSE"><img alt="Licencia AGPL 3.0" src="https://img.shields.io/badge/licencia-AGPL--3.0-cccccc?labelColor=182016"></a></p>
+<p align="center"><img alt="Versión 0.12.0" src="https://img.shields.io/badge/versi%C3%B3n-0.12.0-a0ff32?labelColor=182016"> <img alt="Tizen 6.5 base comprobada" src="https://img.shields.io/badge/Tizen-6.5_base_comprobada-91b8df?labelColor=182016"> <a href="LICENSE"><img alt="Licencia AGPL 3.0" src="https://img.shields.io/badge/licencia-AGPL--3.0-cccccc?labelColor=182016"></a></p>
 
 <p align="center"><a href="#galería">Galería</a> · <a href="docs/INSTALL.md">Instalación</a> · <a href="docs/RESPONSIBLE_USE.md">Uso responsable</a> · <a href="CONTRIBUTING.md">Contribuir</a></p>
 
-> **Experimental · Instalación en modo desarrollador.** La versión pública 0.11.1 se inicia vacía. No incluye catálogo de canales ni importa catálogos externos o del PC.
+> **Experimental · Instalación en modo desarrollador.** La versión pública 0.12.0 se inicia vacía. No incluye catálogo de canales ni importa catálogos externos o del PC.
 
 ## Instalar con ayuda de una IA
 
@@ -26,6 +26,18 @@ En **Ajustes → Añadir un canal**, introduce individualmente un enlace Ace Str
 
 Añade solo enlaces cuya reproducción y, cuando corresponda, redistribución estén autorizadas. Tú eres responsable de los enlaces que introduces. La app no exige casillas ni una pantalla de aceptación. Esta descripción informa del uso responsable; no verifica permisos sobre los contenidos. Consulta [Uso responsable](docs/RESPONSIBLE_USE.md). P2P puede comunicar tu dirección IP a otros pares.
 
+## Más cómodo con el mando
+
+En **Opciones** (junto a Ver canal) encontrarás:
+
+- **Recientes:** los últimos 12 canales que han empezado a reproducirse, sin contar intentos fallidos.
+- **Ordenar favoritos:** elige con ↑/↓ y mueve con ←/→; se conserva el resto de canales.
+- **Editar canal:** cambia el nombre o corrige el enlace. Eliminar pide confirmación y quita ese canal de favoritos y recientes.
+- **Volver donde estabas:** recuerda sección, página y tarjeta seleccionada al abrir de nuevo.
+- **Nombre al cambiar de canal:** un aviso breve al usar CH+/CH−.
+
+Estos datos se guardan localmente. La aplicación pública sigue vacía al instalarla y no recupera directorios de canales externos. [Guía de las opciones](docs/LIBRARY.md).
+
 ## Galería
 
 ![Inicio](docs/images/home.png)
@@ -38,7 +50,7 @@ Añade solo enlaces cuya reproducción y, cuando corresponda, redistribución es
 
 ## Estado
 
-La versión pública 0.11.1 se probó en escritorio. La base del motor Tizen 6.5 se comprobó previamente; eso no significa que esta versión 0.11.1 se haya instalado físicamente en un televisor. Otros modelos requieren verificación.
+La versión pública 0.12.0 se probó en escritorio. La base del motor Tizen 6.5 se comprobó previamente; eso no significa que esta versión 0.12.0 se haya instalado físicamente en un televisor. Otros modelos requieren verificación.
 
 El proyecto es independiente, no está afiliado a Samsung, Ace Stream ni titulares de marcas. Código bajo AGPL-3.0-or-later; consulta [LICENSE](LICENSE) y avisos upstream. No se incluyen logotipos de canales ni recursos promocionales de TV de pago.
 

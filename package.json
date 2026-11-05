@@ -1,12 +1,12 @@
 {
   "name": "ac-tv-samsung",
-  "version": "0.11.1",
+  "version": "0.12.0",
   "private": true,
   "license": "AGPL-3.0-or-later",
   "description": "Empty-by-default Samsung Tizen player for user-provided authorized links",
   "scripts": {
-    "test": "node work/check-native-app.cjs && node work/check-native-transport.cjs && node work/check-local-catalog.cjs && node work/check-channel-logos.cjs",
-    "test:ui": "node -e \"require('fs').mkdirSync('test-results',{recursive:true})\" && node work/check-modern-ui.cjs && node work/check-friendly-loading.cjs && node work/check-onboarding.cjs",
+    "test": "node work/check-native-app.cjs && node work/check-native-transport.cjs && node work/check-local-catalog.cjs && node work/check-channel-logos.cjs && node work/check-library-core.cjs",
+    "test:ui": "node -e \"require('fs').mkdirSync('test-results',{recursive:true})\" && node work/check-modern-ui.cjs && node work/check-friendly-loading.cjs && node work/check-onboarding.cjs && node work/check-library-ui.cjs",
     "test:installer": "node tests/check-installer.cjs"
   },
   "devDependencies": {
