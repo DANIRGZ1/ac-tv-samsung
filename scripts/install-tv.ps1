@@ -2,9 +2,10 @@
 [CmdletBinding(DefaultParameterSetName='Check')]
 param(
     [Parameter(Mandatory=$true)][string]$TvIp,
-    [Parameter(Mandatory=$true)][string]$SecurityProfile,
+    [string]$SecurityProfile,
     [Parameter(ParameterSetName='Install', Mandatory=$true)][switch]$Install,
     [Parameter(ParameterSetName='Check')][switch]$CheckOnly,
+    [Parameter(ParameterSetName='Diagnose', Mandatory=$true)][switch]$Diagnose,
     [Parameter(ParameterSetName='Install')][switch]$Launch,
     [string]$TargetSerial,
     [string]$SdbPath,
@@ -27,10 +28,22 @@ function Invoke-Tool([string]$Executable, [string[]]$Arguments) {
     $code = $LASTEXITCODE
     if ($null -eq $code -or $code -ne 0) { Stop-With "Falló $([IO.Path]::GetFileName($Executable)) (código $code)." }
 }
+function Confirm-TvConnection([string]$Sdb, [string]$Endpoint) {
+    $null = & $Sdb connect $Endpoint 2>&1
+    if ($LASTEXITCODE -ne 0) { Stop-With "No se pudo conectar con $Endpoint. Comprueba la IP, la red y el modo desarrollador de la TV." }
+    $deviceLines = @(& $Sdb devices 2>&1)
+    if ($LASTEXITCODE -ne 0) { Stop-With 'No se pudo consultar sdb devices. Comprueba el SDK y vuelve a intentarlo.' }
+    $targetLines = @($deviceLines | Where-Object { $_ -match ('^\s*' + [regex]::Escape($Endpoint) + '\s+') })
+    if ($targetLines.Count -eq 0) { Stop-With "La TV $Endpoint no aparece en SDB. Verifica su IP y que el modo desarrollador incluya la IP del ordenador." }
+    if ($targetLines.Count -ne 1) { Stop-With "SDB devolvió más de una entrada para $Endpoint. Revisa la conexión en el SDK." }
+    if ($targetLines[0] -match '^\s*\S+\s+offline(?:\s|$)') { Stop-With "La TV $Endpoint aparece offline en SDB. Reinicia la TV y revisa si hay una autorización pendiente en pantalla." }
+    if ($targetLines[0] -notmatch '^\s*\S+\s+device(?:\s|$)') { Stop-With "La TV $Endpoint no está disponible en SDB. Revisa el modo desarrollador y la autorización de la TV." }
+}
 $parsedIp = $null
 if (![Net.IPAddress]::TryParse($TvIp, [ref]$parsedIp) -or $parsedIp.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork) { Stop-With 'TvIp debe ser una dirección IPv4 literal.' }
-if ([string]::IsNullOrWhiteSpace($SecurityProfile) -or $SecurityProfile -notmatch '^[A-Za-z0-9_.-]+$') { Stop-With 'SecurityProfile debe ser el nombre de un perfil propio ya existente (sin contraseña).' }
-$tizen = Resolve-Tool $TizenPath 'tizen'
+if (!$Diagnose -and ([string]::IsNullOrWhiteSpace($SecurityProfile) -or $SecurityProfile -notmatch '^[A-Za-z0-9_.-]+$')) { Stop-With 'SecurityProfile debe ser el nombre de un perfil propio ya existente (sin contraseña).' }
+$tizen = $null
+if (!$Diagnose) { $tizen = Resolve-Tool $TizenPath 'tizen' }
 $sdb = Resolve-Tool $SdbPath 'sdb'
 $appDir = Join-Path (Split-Path -Parent $PSScriptRoot) 'work/acetv-native-app'
 $manifest = Join-Path $appDir 'config.xml'
@@ -44,30 +57,27 @@ $applicationId = [string]$applicationNode.GetAttribute('id')
 if ($applicationId -ne 'AcTVPublic.AceTV') { Stop-With "El manifiesto no tiene el ID público esperado (encontrado: $applicationId)." }
 $version = [string]$xml.DocumentElement.GetAttribute('version')
 Write-Output "Aplicación: Ace TV $version ($applicationId)"
+$endpoint = $parsedIp.ToString() + ':26101'
+if ($Diagnose) {
+    Confirm-TvConnection $sdb $endpoint
+    Write-Output "Diagnóstico correcto: TV $endpoint conectada y disponible. No se ha firmado ni instalado nada."
+    exit 0
+}
 Write-Output "Herramientas: tizen=$tizen ; sdb=$sdb"
 Write-Output "Perfil de firma: $SecurityProfile"
 Write-Output 'Comprobación local correcta. No se ha conectado a la TV ni se ha firmado/instalado nada.'
 if (!$Install) { exit 0 }
+if ($TargetSerial -and $TargetSerial -ne $endpoint) { Stop-With "El TargetSerial no coincide con la TV indicada ($endpoint)." }
 $stage = Join-Path ([IO.Path]::GetTempPath()) ('acetv-install-' + [guid]::NewGuid().ToString('N'))
 try {
     $null = New-Item -ItemType Directory -Path $stage
     Invoke-Tool $tizen @('package','-t','wgt','-s',$SecurityProfile,'-o',$stage,'--',$appDir)
     $packages = @(Get-ChildItem -LiteralPath $stage -Filter '*.wgt' -File)
     if ($packages.Count -ne 1) { Stop-With "La firma debía producir exactamente un WGT; produjo $($packages.Count)." }
-    $package = $packages[0].FullName
-    $endpoint = $parsedIp.ToString() + ':26101'
-    Invoke-Tool $sdb @('connect',$endpoint)
-    if (!$TargetSerial) {
-        $deviceLines = @(& $sdb devices)
-        if ($LASTEXITCODE -ne 0) { Stop-With 'No se pudo consultar sdb devices.' }
-        $serials = @($deviceLines | ForEach-Object { if ($_ -match '^\s*(\S+)\s+device(?:\s|$)') { $Matches[1] } } | Where-Object { $_ -eq $endpoint })
-        if ($serials.Count -ne 1) { Stop-With "No se detectó de forma única la TV ($endpoint); usa -TargetSerial con el identificador que muestra sdb devices." }
-        $TargetSerial = $serials[0]
-    }
-    if ($TargetSerial -notmatch '^[A-Za-z0-9_.:-]+$') { Stop-With 'TargetSerial contiene caracteres no válidos.' }
-    Invoke-Tool $tizen @('install','-n',$packages[0].Name,'-s',$TargetSerial,'--',$stage)
-    if ($Launch) { Invoke-Tool $tizen @('run','-p',$applicationId,'-s',$TargetSerial) }
-    Write-Output "Instalación completada en $TargetSerial. No se ha desinstalado ninguna aplicación."
+    Confirm-TvConnection $sdb $endpoint
+    Invoke-Tool $tizen @('install','-n',$packages[0].Name,'-s',$endpoint,'--',$stage)
+    if ($Launch) { Invoke-Tool $tizen @('run','-p',$applicationId,'-s',$endpoint) }
+    Write-Output "Instalación completada en $endpoint. No se ha desinstalado ninguna aplicación."
 }
 finally {
     $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar

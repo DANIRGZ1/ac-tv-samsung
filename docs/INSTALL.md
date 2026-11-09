@@ -6,7 +6,7 @@ AC TV es experimental y requiere modo desarrollador y herramientas del SDK de Sa
 
 Puedes seguir el [tutorial para Codex](INSTALL_WITH_CODEX.md) o el [tutorial para Claude Code](INSTALL_WITH_CLAUDE.md). Ambos incluyen un mensaje de diagnóstico y otro de instalación para copiar, trabajando desde tu ordenador en la misma red que la TV.
 
-## Comprobar
+## 1. Comprobar el ordenador
 
 Desde la raíz del repositorio, con PowerShell 7:
 
@@ -14,9 +14,26 @@ Desde la raíz del repositorio, con PowerShell 7:
 pwsh -File ./scripts/install-tv.ps1 -TvIp 192.168.1.42 -SecurityProfile MiPerfilTV
 ```
 
-La comprobación predeterminada valida parámetros y herramientas localmente; no conecta con la TV, firma ni instala.
+La comprobación predeterminada valida los parámetros, las rutas de las herramientas y el manifiesto de la app. El perfil indicado se comprueba al firmar.
 
-## Instalar
+## 2. Diagnosticar la conexión con la TV
+
+Con el televisor encendido y en modo desarrollador, ejecuta:
+
+```powershell
+pwsh -File ./scripts/install-tv.ps1 -TvIp 192.168.1.42 -Diagnose
+```
+
+Esto comprueba si `sdb` detecta la TV indicada. Puedes hacerlo antes de crear el perfil de firma. El diagnóstico no instala ni abre aplicaciones.
+
+| Resultado | Qué revisar |
+| --- | --- |
+| Falta `sdb` | Instala el SDK o indica la ruta al ejecutable con `-SdbPath`. |
+| TV no detectada | Comprueba la IP de la TV, que ambos equipos estén en la misma red y que el modo desarrollador tenga la IP actual del ordenador. |
+| TV detectada pero sin conexión | Reinicia la TV tras configurar el modo desarrollador. Confirma cualquier autorización que aparezca en pantalla y repite la prueba. |
+| Conexión correcta, pero la instalación falla | Revisa en Certificate Manager que el perfil incluya el televisor y que los certificados sigan vigentes. |
+
+## 3. Instalar
 
 ```powershell
 pwsh -File ./scripts/install-tv.ps1 -TvIp 192.168.1.42 -SecurityProfile MiPerfilTV -Install -Launch
@@ -24,7 +41,9 @@ pwsh -File ./scripts/install-tv.ps1 -TvIp 192.168.1.42 -SecurityProfile MiPerfil
 
 Configura Developer Mode en la TV, conecta ordenador y televisor a la misma red y crea un perfil de firma que incluya el dispositivo. El nombre y ruta de los menús varían por modelo. El script no crea certificados ni guarda contraseñas. Una instalación con el mismo ID puede actualizarse conforme al SDK y al televisor.
 
-El instalador se ha verificado con herramientas simuladas; la instalación real requiere el SDK y certificados compatibles. La base de Tizen 6.5 se probó antes, pero no se afirma que la versión pública 0.11.1 se haya instalado físicamente en una TV.
+El instalador comprueba que la TV indicada en `-TvIp` esté disponible en SDB. Si especificas `-TargetSerial`, debe coincidir con la dirección de esa TV y el puerto `26101`.
+
+Consulta la [compatibilidad y el estado de las pruebas](COMPATIBILITY.md).
 
 ## Primer uso
 

@@ -31,22 +31,23 @@ La primera vez, Claude Code te pedirá iniciar sesión mediante el navegador. Ha
 
 ## 3. Fase de diagnóstico
 
-Sustituye los valores y pega este prompt en Claude Code. En esta fase se permite solo el diagnóstico local; el script no conecta con la TV, no firma ni instala.
+Sustituye los valores y pega este prompt en Claude Code. Esta fase comprueba el ordenador y prueba la conexión con la TV indicada.
 
 ```text
 Trabaja en este repositorio local de ac-tv-samsung. Quiero instalar la app incluida en mi televisor Samsung Tizen, conectado a la misma red local que este PC.
 
 Valores: TV_IP=192.168.1.42; MI_PERFIL=MiPerfilTV
 
-Primero, inspecciona docs/INSTALL.md y scripts/install-tv.ps1. Confirma los requisitos y dime qué comandos ejecutarías. Puedes ejecutar únicamente el diagnóstico predeterminado:
-pwsh -File ./scripts/install-tv.ps1 -TvIp 192.168.1.42 -SecurityProfile MiPerfilTV
+Primero, inspecciona docs/INSTALL.md y scripts/install-tv.ps1. Puedes ejecutar únicamente estos dos comandos:
+pwsh -File ./scripts/install-tv.ps1 -TvIp 192.168.1.42 -SecurityProfile MiPerfilTV -CheckOnly
+pwsh -File ./scripts/install-tv.ps1 -TvIp 192.168.1.42 -Diagnose
 
 No uses -Install ni -Launch en esta fase. No cambies archivos, certificados, configuración de la TV ni otras aplicaciones. Si falta algo o el diagnóstico falla, explica cómo resolverlo y espera.
 ```
 
 ## 4. Autorizar la instalación expresamente
 
-Revisa el resultado. Si todo está listo, envía un segundo mensaje como este para autorizar el cambio de red e instalación:
+Revisa el resultado. Si todo está listo, envía un segundo mensaje como este para autorizar la instalación:
 
 ```text
 Autorizo ahora la instalación de la app incluida en este repositorio en la TV 192.168.1.42 con mi perfil existente MiPerfilTV. Ejecuta exactamente:

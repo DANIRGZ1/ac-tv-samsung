@@ -23,20 +23,21 @@ Si aún no tienes la aplicación local, sigue el [inicio oficial de OpenAI](http
 
 ## 3. Primero pide solo un diagnóstico
 
-Pega este texto en Codex y sustituye los dos valores. Esta primera fase solo ejecuta la comprobación local: no conecta con la TV, no firma ni instala.
+Pega este texto en Codex y sustituye los dos valores. Esta fase comprueba el ordenador y prueba la conexión con la TV indicada.
 
 ```text
 Trabaja en este repositorio local de ac-tv-samsung. Quiero instalar la app incluida en mi televisor Samsung Tizen, que está en la misma red local que este PC.
 
 Valores: TV_IP=192.168.1.42; MI_PERFIL=MiPerfilTV
 
-Primero, inspecciona docs/INSTALL.md y scripts/install-tv.ps1. Confirma los requisitos y dime qué comandos ejecutarías. Puedes ejecutar únicamente el diagnóstico predeterminado:
-pwsh -File ./scripts/install-tv.ps1 -TvIp 192.168.1.42 -SecurityProfile MiPerfilTV
+Primero, inspecciona docs/INSTALL.md y scripts/install-tv.ps1. Puedes ejecutar únicamente estos dos comandos:
+pwsh -File ./scripts/install-tv.ps1 -TvIp 192.168.1.42 -SecurityProfile MiPerfilTV -CheckOnly
+pwsh -File ./scripts/install-tv.ps1 -TvIp 192.168.1.42 -Diagnose
 
 No uses -Install ni -Launch en esta fase. No cambies archivos, certificados, configuración de la TV ni otras aplicaciones. Si falta algo o el diagnóstico falla, explica cómo resolverlo y espera.
 ```
 
-El modo predeterminado comprueba parámetros, herramientas y el manifiesto de la app incluida. No establece conexión de red con el televisor.
+`-CheckOnly` comprueba el entorno local. `-Diagnose` usa `sdb` para comprobar que la TV está accesible. Para los errores más habituales, consulta la [guía de instalación](INSTALL.md).
 
 ## 4. Revisar y autorizar la instalación
 

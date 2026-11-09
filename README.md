@@ -6,7 +6,7 @@
 
 <p align="center"><img alt="Versión 0.12.0" src="https://img.shields.io/badge/versi%C3%B3n-0.12.0-a0ff32?labelColor=182016"> <img alt="Tizen 6.5 base comprobada" src="https://img.shields.io/badge/Tizen-6.5_base_comprobada-91b8df?labelColor=182016"> <a href="LICENSE"><img alt="Licencia AGPL 3.0" src="https://img.shields.io/badge/licencia-AGPL--3.0-cccccc?labelColor=182016"></a></p>
 
-<p align="center"><a href="#galería">Galería</a> · <a href="docs/INSTALL.md">Instalación</a> · <a href="docs/RESPONSIBLE_USE.md">Uso responsable</a> · <a href="CONTRIBUTING.md">Contribuir</a></p>
+<p align="center"><a href="#galería">Galería</a> · <a href="docs/INSTALL.md">Instalación</a> · <a href="docs/COMPATIBILITY.md">Compatibilidad y ayuda</a> · <a href="docs/RESPONSIBLE_USE.md">Uso responsable</a> · <a href="CONTRIBUTING.md">Contribuir</a></p>
 
 > **Experimental · Instalación en modo desarrollador.** La versión pública 0.12.0 se inicia vacía. No incluye catálogo de canales ni importa catálogos externos o del PC.
 
@@ -18,7 +18,7 @@ Elige tu guía:
 - **[Instalar con Claude Code](docs/INSTALL_WITH_CLAUDE.md)** — desde el ordenador conectado a la misma red que la TV.
 - **[Instalación manual](docs/INSTALL.md)** — comandos del asistente de instalación.
 
-Los tutoriales explican qué puede automatizar la IA y qué debes completar tú: activar el modo desarrollador y preparar tus certificados Samsung.
+Los tutoriales separan la comprobación del ordenador, el diagnóstico de conexión con `-Diagnose` y la instalación. Puedes probar la conexión antes de preparar los certificados Samsung.
 
 ## Cómo empezar
 
