@@ -44,6 +44,7 @@
       }catch(e){postMessage({target:'custom',userData:{type:'discovery-diagnostic',stage:'catalog',reason:String(e.message||e).slice(0,160)}});}finally{if(socket)socket.close()}
     }
     if(!descriptor)throw Error('No authenticated descriptor returned by the content catalog');
+    postMessage({target:'custom',userData:{type:'milestone',stage:'descriptor-ready'}});
     var info=JSON.parse(wasm_bindgen.descriptor_info_json(descriptor));if(!info.is_live)throw Error('This receiver supports live streams');
     var infohash=Uint8Array.from(info.infohash.match(/../g),function(h){return parseInt(h,16)}),peerid=new Uint8Array(20);
     var seed=identitySeed;if(!(seed instanceof Uint8Array)||seed.length!==32){seed=new Uint8Array(32);crypto.getRandomValues(seed);}
@@ -70,6 +71,7 @@
     // all of the second tracker's candidates behind the connection-probe budget.
     for(var index=0;index<64&&peers.length<32;index++){for(var g=0;g<peerGroups.length&&peers.length<32;g++){var next=peerGroups[g][index];if(next&&!peers.some(function(p){return p.host===next.host&&p.port===next.port}))peers.push(next);}}
     if(!peers.length)throw Error('No peers found through supported UDP trackers; DHT and HTTP trackers remain pending');
+    postMessage({target:'custom',userData:{type:'milestone',stage:'peers-ready'}});
     return {descriptor:descriptor,peers:peers};
   }};
 })();

@@ -26,39 +26,50 @@ if(typeof importScripts==='function'){
       if(done)return;
       nativeMode=cfg.nativePlayback===true;report({type:'playback-mode',mode:nativeMode?'native':'mse'});
       if(nativeMode){var nonce=new Uint8Array(16);self.crypto.getRandomValues(nonce);var token=Array.from(nonce).map(function(v){return ('0'+v.toString(16)).slice(-2)}).join('');var port=Module.ccall('stream_open','number',['string'],[token]);if(port<=0)throw Error('Local stream listener failed '+port);streamUrl='http://127.0.0.1:'+port+'/'+token+'.ts';}
-      var descriptor,candidates=null,activeAddress=null,reportedPeer=false,preferredCandidate=false,seed=new Uint8Array(32);self.crypto.getRandomValues(seed);
+      var descriptor,candidates=null,activeAddress=null,reportedPeer=false,seed=new Uint8Array(32);self.crypto.getRandomValues(seed);
       if(cfg.contentId){importScripts('discovery.js');var resolved=await AceDiscovery.resolve(cfg.contentId,cfg.identifierKind,seed);descriptor=resolved.descriptor;candidates=resolved.peers;}
       else descriptor=Uint8Array.from(atob(cfg.descriptorBase64),function(c){return c.charCodeAt(0)});
-      if(candidates){
-        var hint=cfg.preferredPeer;if(hint&&typeof hint.host==='string'&&AceDiscovery.isPublicIPv4(hint.host)&&Number.isInteger(hint.port)&&hint.port>0&&hint.port<65536){candidates=candidates.filter(function(p){return p.host!==hint.host||p.port!==hint.port});candidates.unshift({host:hint.host,port:hint.port});preferredCandidate=true;}
-        importScripts('peer-selector.js');
-        candidates=await AcePeerSelector.select(descriptor,candidates,function(p){report({type:'peer-selection',stage:p.stage,count:p.count,head:p.head,attempted:p.attempted,total:p.total})},{maxUsable:preferredCandidate?1:2,budgetMs:20000,isCancelled:function(){return done}});
-        if(!candidates.length)throw Error('No peer completed a valid live handshake');
-      }
       if(done)return;
-      peer=new wasm_bindgen.LivePeer(descriptor,seed);ptr=Module._malloc(65536);if(!ptr)throw Error('No network buffer');
       if(candidates){
-        report({type:'progress',stage:'connecting-to-peer',candidates:candidates.length});
-        for(var candidate=0;candidate<Math.min(candidates.length,8);candidate++){
+        var hint=cfg.preferredPeer;
+        if(hint&&typeof hint.host==='string'&&AceDiscovery.isPublicIPv4(hint.host)&&Number.isInteger(hint.port)&&hint.port>0&&hint.port<65536){
+          candidates=candidates.filter(function(p){return p.host!==hint.host||p.port!==hint.port;});
+          candidates.unshift({host:hint.host,port:hint.port});
+        }
+        importScripts('peer-selector.js');
+        function probeProgress(p){report({type:'peer-selection',stage:p.stage,count:p.count,head:p.head,attempted:p.attempted,total:p.total});}
+        // Start with the first verified peer. Only probe a second if reopening the first socket fails.
+        for(var attempt=0;attempt<2&&candidates.length&&!done;attempt++){
+          var usable=await AcePeerSelector.select(descriptor,candidates,probeProgress,{maxUsable:1,budgetMs:20000,isCancelled:function(){return done;}});
+          if(done)return;
+          if(!usable.length)break;
+          var address=usable[0];
+          report({type:'progress',stage:'connecting-to-peer'});
           try{
-            var address=candidates[candidate];var code=Module.ccall('net_connect','number',['string','number'],[address.host,address.port]);
+            var code=Module.ccall('net_connect','number',['string','number'],[address.host,address.port]);
             if(code<0)throw Error('Peer connection refused');
             if(code!==1)await new Promise(function(resolve,reject){var began=Date.now();Module.peerTick=function(){var ready=Module._net_ready();if(ready===1){Module.peerTick=null;resolve()}else if(ready<0||Date.now()-began>4000){Module.peerTick=null;reject(Error('Peer unavailable'))}}});
             connected=true;activeAddress=address;break;
-          }catch(e){Module._net_close();}
+          }catch(e){
+            Module._net_close();
+            candidates=candidates.filter(function(p){return p.host!==address.host||p.port!==address.port;});
+          }
         }
         if(!connected)throw Error('No reachable peer in tracker results');
       } else {
         var rc=Module.ccall('net_connect','number',['string','number'],[cfg.host,cfg.port]);if(rc<0)throw Error('connect errno '+(-rc));connected=rc===1;
       }
+      if(done)return;
+      peer=new wasm_bindgen.LivePeer(descriptor,seed);ptr=Module._malloc(65536);if(!ptr)throw Error('No network buffer');
       lastProgress=Date.now();lastVerified=Date.now();report({type:'progress',stage:'connecting'});
+      if(connected)report({type:'milestone',stage:'peer-connected'});
       Module.peerTick=function(){try{
         if(done)return;if(cfg.expectedPieces&&Date.now()-start>150000)throw Error('Fixture test exceeded 150 seconds');
         if(nativeMode&&(!drainStream()||Module._stream_buffered()>6*1024*1024)){lastProgress=lastVerified=Date.now();return;}
         if(Date.now()-lastProgress>20000&&playbackAhead<12)throw Error('Peer made no progress for 20 seconds');
         if(Date.now()-lastVerified>30000&&playbackAhead<12)throw Error('No authenticated media piece completed for 30 seconds');
         if(playbackAhead>12){lastProgress=Date.now();return;}
-        if(!connected){var ready=Module._net_ready();if(ready<0)throw Error('connect errno '+(-ready));if(!ready)return;connected=true;}
+        if(!connected){var ready=Module._net_ready();if(ready<0)throw Error('connect errno '+(-ready));if(!ready)return;connected=true;report({type:'milestone',stage:'peer-connected'});}
         if(!pending.length)pending=peer.take_outgoing();
         if(pending.length){var b=pending.subarray(0,65536);Module.HEAPU8.set(b,ptr);var n=Module._net_write(ptr,b.length);if(n<0)throw Error('send errno '+(-n));pending=pending.subarray(n);sent+=n;}
         for(var i=0;i<4;i++){
@@ -67,7 +78,7 @@ if(typeof importScripts==='function'){
           var media=peer.take_media();if(media.length){mediaTotal+=media.length;if(nativeMode){streamPending=media;drainStream();}else{mediaParts.push(media);mediaLength+=media.length;if(mediaLength>=188000)flushMedia();}}
           var state=JSON.parse(peer.status_json());if(state.verified_pieces>verifiedCount){verifiedCount=state.verified_pieces;lastVerified=Date.now();}
           if(state.verified_pieces>0&&activeAddress&&!reportedPeer){reportedPeer=true;report({type:'peer-verified',peer:{host:activeAddress.host,port:activeAddress.port}});}
-          if(nativeMode&&media.length)report({type:'media-progress',bytes:mediaTotal,verifiedPieces:verifiedCount,localBuffered:Module._stream_buffered()});
+          if(nativeMode&&media.length){if(mediaTotal===media.length)report({type:'milestone',stage:'first-media'});report({type:'media-progress',bytes:mediaTotal,verifiedPieces:verifiedCount,localBuffered:Module._stream_buffered()});}
           if(cfg.expectedPieces&&state.verified_pieces>=cfg.expectedPieces){if(mediaTotal!==cfg.expectedMediaBytes)throw Error('Fixture media length mismatch');if(streamPending.length)throw Error('Fixture pending local media at completion');finish();return;}
           if(nativeMode&&streamPending.length)break;
         }

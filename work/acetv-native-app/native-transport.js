@@ -8,7 +8,7 @@
     if(!config||!/^[a-f0-9]{40}$/i.test(config.contentId))return Promise.reject(Error('Enlace no válido'));
     var token=generation,keyBytes=new Uint8Array(16);crypto.getRandomValues(keyBytes);bridgeKey=Array.from(keyBytes).map(function(n){return ('0'+n.toString(16)).slice(-2)}).join('');
     var cacheKey=String(config.identifierKind)+':'+config.contentId,preferred=peerCache[cacheKey];if(preferred&&Date.now()-preferred.verifiedAt>120000){delete peerCache[cacheKey];preferred=null;}
-    activeCacheKey=cacheKey;last={state:'connecting',verifiedPieces:0,receivedMediaBytes:0,peerCacheHit:!!preferred};
+    activeCacheKey=cacheKey;var startedAt=Date.now();last={state:'connecting',verifiedPieces:0,receivedMediaBytes:0,peerCacheHit:!!preferred,milestones:{}};
     return new Promise(function(resolve,reject){
       pendingReject=reject;var settled=false,currentKey=bridgeKey;
       function failure(message){if(token!==generation)return;delete peerCache[cacheKey];last.state='error';last.error=String(message);clearTimeout(deadline);if(!settled){settled=true;pendingReject=null;reject(Error(last.error))}else if(onError)onError(last.error)}
@@ -19,6 +19,10 @@
         if(event.source!==child.contentWindow)return;
         var d=event.data;if(!d||d.aceNativeEvent!==true||d.key!==currentKey||!d.payload)return;d=d.payload;
         last.stage=d.stage||d.type;last.eventAt=Date.now();if(typeof d.count==='number')last.candidates=d.count;
+        // Record milestone names and elapsed time without peer addresses.
+        var milestone=d.type==='milestone'?d.stage:(d.type==='peer-selection'&&d.stage==='verified'?'peer-authenticated':(d.type==='progress'&&/^(resolving-content|finding-peers|connecting-to-peer|connecting)$/.test(d.stage)?d.stage:null));
+        if(milestone&&last.milestones[milestone]===undefined&&/^(descriptor-ready|peers-ready|peer-connected|first-media|peer-authenticated|resolving-content|finding-peers|connecting-to-peer|connecting)$/.test(milestone))last.milestones[milestone]=Date.now()-startedAt;
+        if(d.type==='local-stream')last.milestones['local-stream-ready']=Date.now()-startedAt;
         if(d.type==='peer-verified'){remember(cacheKey,d.peer);}
         else if(d.type==='local-stream'){
           if(!/^http:\/\/127\.0\.0\.1:([0-9]{1,5})\/[a-f0-9]{32}\.ts$/.test(d.url))return failure('Dirección local no válida');

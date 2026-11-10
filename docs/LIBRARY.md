@@ -39,3 +39,9 @@ AC TV recuerda la sección, la página y la tarjeta seleccionada. Si ese canal y
 Los cambios de canal/favoritos/recientes se guardan con una copia de recuperación local para restaurar un cambio interrumpido al abrir la aplicación. Si falla el almacenamiento, la app informa del problema en lugar de dar por guardado el cambio.
 
 Todas las imágenes usan nombres ficticios e identificadores sintéticos. No representan emisiones reales ni un catálogo incluido.
+
+## Enlaces alternativos y canal anterior
+
+- Guarda los enlaces del mismo canal con el mismo nombre. AC TV agrupa sus tarjetas y favoritos e ignora diferencias de mayúsculas, tildes y espacios repetidos. Usa nombres distintos para emisiones que quieras mantener separadas.
+- En la tarjeta, abre **Opciones → Enlaces del canal**. **Usar primero** guarda el preferido. **Ver ahora** abre solo el enlace elegido. Si falla la apertura, **Probar otro enlace** permite pasar al siguiente.
+- El **botón azul** vuelve al canal anterior durante la sesión y permite alternar cuando ambos canales han empezado a reproducirse. También funciona con la tecla **Canal anterior** si el mando la ofrece. Pulsa **Atrás** para recuperar la tarjeta del canal.
