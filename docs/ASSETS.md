@@ -1,9 +1,9 @@
 # Recursos visuales
 
-- [Logo de la aplicación](../work/acetv-native-app/brand-acetv.svg) y [fuente del icono](brand/icon.svg). El paquete Tizen usa `work/acetv-native-app/icon.png`.
+- [Logo de la aplicación](../work/acetv-native-app/brand-acetv.svg) y [fuente del icono](brand/icon.svg). El icono reutiliza el logo horizontal de la aplicación sobre el fondo oscuro de la interfaz. El paquete Tizen usa `work/acetv-native-app/icon.png`.
 - [Fuente de la portada](brand/cover.html). La pantalla conserva la proporción 16:9 de la captura y se muestra de frente.
 
-Para regenerar el icono y la portada con Chrome instalado, ejecuta `npm ci` y `node work/render-brand.cjs` desde el repositorio.
+Para regenerar el icono y la portada con Chrome instalado, ejecuta `npm ci` y `node work/render-brand.cjs` desde el repositorio. Para regenerar solo el icono, usa `node work/render-brand.cjs --icon-only`.
 
 - `work/acetv-native-app/assets/stadium.png`: fondo generado para el proyecto, sin texto ni logos.
 - `work/acetv-native-app/assets/categories.png`: imágenes genéricas de categorías, sin texto ni logos.

@@ -1,5 +1,9 @@
 # Historial de versiones
 
+## 0.14.1
+
+- La tarjeta de Samsung usa el mismo logotipo horizontal que aparece dentro de AC TV.
+
 ## 0.14.0
 
 - El motor empieza con el primer emisor verificado y solo vuelve a buscar si falla la conexión. Registra los tiempos de búsqueda, conexión y llegada de vídeo.
