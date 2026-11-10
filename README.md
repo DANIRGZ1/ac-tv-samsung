@@ -1,59 +1,68 @@
-<p align="center"><img src="docs/images/cover.png" alt="AC TV, reproductor para Samsung Tizen" width="100%"></p>
+<p align="center"><img src="docs/images/cover.png" alt="AC TV para Samsung Tizen" width="100%"></p>
 
 <h1 align="center">AC TV para Samsung</h1>
-<p align="center"><strong>Añade tus enlaces. Guarda tus canales. Reproduce con el mando.</strong></p>
-<p align="center">Reproductor experimental para Samsung Tizen con motor P2P integrado y vídeo nativo AVPlay.</p>
+<p align="center"><strong>Tus enlaces, tus favoritos y el mando de tu Samsung.</strong></p>
+<p align="center">Reproductor experimental de enlaces Ace Stream para Samsung Tizen. Una vez instalado, el motor integrado reproduce desde la tele con AVPlay.</p>
 
-<p align="center"><img alt="Versión 0.12.0" src="https://img.shields.io/badge/versi%C3%B3n-0.12.0-a0ff32?labelColor=182016"> <img alt="Tizen 6.5 base comprobada" src="https://img.shields.io/badge/Tizen-6.5_base_comprobada-91b8df?labelColor=182016"> <a href="LICENSE"><img alt="Licencia AGPL 3.0" src="https://img.shields.io/badge/licencia-AGPL--3.0-cccccc?labelColor=182016"></a></p>
+<p align="center">
+  <img alt="Versión pública 0.12.0" src="https://img.shields.io/badge/versión-0.12.0-A0FF32?labelColor=182016">
+  <img alt="Samsung Tizen" src="https://img.shields.io/badge/Samsung-Tizen-91B8DF?labelColor=182016">
+  <a href="LICENSE"><img alt="Licencia AGPL 3.0" src="https://img.shields.io/badge/licencia-AGPL--3.0-CCCCCC?labelColor=182016"></a>
+</p>
 
-<p align="center"><a href="#galería">Galería</a> · <a href="docs/INSTALL.md">Instalación</a> · <a href="docs/COMPATIBILITY.md">Compatibilidad y ayuda</a> · <a href="docs/RESPONSIBLE_USE.md">Uso responsable</a> · <a href="CONTRIBUTING.md">Contribuir</a></p>
+<p align="center"><a href="#instalación">Instalación</a> · <a href="#galería">Galería</a> · <a href="#preguntas-frecuentes">Preguntas frecuentes</a> · <a href="docs/COMPATIBILITY.md">Compatibilidad y ayuda</a></p>
 
-> **Experimental · Instalación en modo desarrollador.** La versión pública 0.12.0 se inicia vacía. No incluye catálogo de canales ni importa catálogos externos o del PC.
+> **Instalación en modo desarrollador.** AC TV se instala desde este repositorio con el SDK y un perfil de firma de Samsung. Al abrirla por primera vez, la biblioteca está vacía.
 
-## Instalar con ayuda de una IA
+## Qué puedes hacer
 
-Elige tu guía:
+| Añade tus enlaces | Encuentra lo que guardaste | Reproduce con el mando |
+| --- | --- | --- |
+| Guarda enlaces compatibles con el nombre que quieras. Puedes corregir el enlace o cambiar el nombre más tarde. | Busca por nombre, ordena tus favoritos y vuelve a los últimos 12 canales reproducidos. | Navega con las flechas, abre con **OK** y cambia de canal con **CH+/CH−**. |
 
-- **[Instalar con Codex](docs/INSTALL_WITH_CODEX.md)** — aplicación local o CLI, con instrucciones para copiar.
-- **[Instalar con Claude Code](docs/INSTALL_WITH_CLAUDE.md)** — desde el ordenador conectado a la misma red que la TV.
-- **[Instalación manual](docs/INSTALL.md)** — comandos del asistente de instalación.
+La app guarda la biblioteca y recuerda tu última selección en la tele. [Ver la guía de canales y favoritos](docs/LIBRARY.md)
 
-Los tutoriales separan la comprobación del ordenador, el diagnóstico de conexión con `-Diagnose` y la instalación. Puedes probar la conexión antes de preparar los certificados Samsung.
+## Instalación
 
-## Cómo empezar
+1. **Prepara la TV y el ordenador.** Activa el modo desarrollador, conecta ambos a la misma red y prepara un perfil de firma Samsung válido para tu televisor.
+2. **Comprueba la conexión e instala.** El instalador separa el diagnóstico con `-Diagnose` de la firma e instalación.
+3. **Añade tu primer enlace.** En la TV, abre **Ajustes → Añadir un canal**, ponle un nombre y elige **Guardar** o **Reproducir**.
 
-En **Ajustes → Añadir un canal**, introduce individualmente un enlace Ace Stream compatible. Ponle el nombre que quieras y guárdalo o reprodúcelo. Los canales guardados y favoritos se buscan localmente en la TV. Las listas M3U no están implementadas.
-
-Añade solo enlaces cuya reproducción y, cuando corresponda, redistribución estén autorizadas. Tú eres responsable de los enlaces que introduces. La app no exige casillas ni una pantalla de aceptación. Esta descripción informa del uso responsable; no verifica permisos sobre los contenidos. Consulta [Uso responsable](docs/RESPONSIBLE_USE.md). P2P puede comunicar tu dirección IP a otros pares.
-
-## Más cómodo con el mando
-
-En **Opciones** (junto a Ver canal) encontrarás:
-
-- **Recientes:** los últimos 12 canales que han empezado a reproducirse, sin contar intentos fallidos.
-- **Ordenar favoritos:** elige con ↑/↓ y mueve con ←/→; se conserva el resto de canales.
-- **Editar canal:** cambia el nombre o corrige el enlace. Eliminar pide confirmación y quita ese canal de favoritos y recientes.
-- **Volver donde estabas:** recuerda sección, página y tarjeta seleccionada al abrir de nuevo.
-- **Nombre al cambiar de canal:** un aviso breve al usar CH+/CH−.
-
-Estos datos se guardan localmente. La aplicación pública sigue vacía al instalarla y no recupera directorios de canales externos. [Guía de las opciones](docs/LIBRARY.md).
+| Elige cómo instalar | |
+| --- | --- |
+| **Con Codex** | [Tutorial con instrucciones para copiar](docs/INSTALL_WITH_CODEX.md) |
+| **Con Claude Code** | [Tutorial desde el ordenador de tu red local](docs/INSTALL_WITH_CLAUDE.md) |
+| **Manual** | [Requisitos, diagnóstico y comandos](docs/INSTALL.md) |
 
 ## Galería
 
-![Inicio](docs/images/home.png)
+![Pantalla de inicio de AC TV](docs/images/home.png)
 
-<table><tr><td width="50%"><strong>Canales</strong><br><img src="docs/images/channels.png" alt="Listado de demostración con nombres genéricos" width="100%"></td><td width="50%"><strong>Favoritos</strong><br><img src="docs/images/favorites.png" alt="Favoritos de demostración" width="100%"></td></tr><tr><td><strong>Búsqueda</strong><br><img src="docs/images/search-results.png" alt="Resultados sintéticos" width="100%"></td><td><strong>Reproducción</strong><br><img src="docs/images/loading.png" alt="Carga de canal de demostración" width="100%"></td></tr></table>
+<table>
+  <tr>
+    <td width="50%"><strong>Explora tus canales</strong><br><img src="docs/images/channels.png" alt="Biblioteca de demostración" width="100%"></td>
+    <td width="50%"><strong>Busca por nombre</strong><br><img src="docs/images/search-results.png" alt="Resultados de búsqueda de demostración" width="100%"></td>
+  </tr>
+  <tr>
+    <td><strong>Ordena tus favoritos</strong><br><img src="docs/images/order-favorites.png" alt="Orden de favoritos con el mando" width="100%"></td>
+    <td><strong>Añade tu propio enlace</strong><br><img src="docs/images/add-link.png" alt="Formulario de alta de un canal" width="100%"></td>
+  </tr>
+</table>
 
-[Ver capturas y pantallas de demostración →](docs/GALLERY.md)
+*Capturas de escritorio con datos ficticios. «Fútbol1» y «Campeones1» son ejemplos de interfaz.* [Ver todas las pantallas](docs/GALLERY.md)
 
-*Imágenes de interfaz con datos ficticios. “Fútbol1” y “Campeones1” son nombres de demostración; los identificadores sintéticos no funcionan. No representan canales ni emisiones reales.*
+## Preguntas frecuentes
 
-## Estado
+**¿Está en la tienda Samsung?** La instalación pública se hace en modo desarrollador. [Ver la guía](docs/INSTALL.md)
 
-La versión pública 0.12.0 se probó en escritorio. La base del motor Tizen 6.5 se comprobó previamente; eso no significa que esta versión 0.12.0 se haya instalado físicamente en un televisor. Otros modelos requieren verificación.
+**¿Tengo que dejar el PC encendido?** El ordenador se usa para instalar. El motor de reproducción funciona en la TV.
 
-El proyecto es independiente, no está afiliado a Samsung, Ace Stream ni titulares de marcas. Código bajo AGPL-3.0-or-later; consulta [LICENSE](LICENSE) y avisos upstream. No se incluyen logotipos de canales ni recursos promocionales de TV de pago.
+**¿De dónde salen los canales?** Tú añades los enlaces uno a uno. La búsqueda recorre tus canales guardados. La importación de listas M3U está pendiente.
 
-Consulta [compilación](docs/BUILD.md), [recursos](docs/ASSETS.md) y [estructura del repositorio](docs/REPOSITORY.md).
+**¿Qué modelos están comprobados?** La base del motor se probó en Tizen 6.5. La versión pública 0.12.0 se comprobó en escritorio y su instalación física sigue pendiente de verificar. [Consultar compatibilidad o compartir una prueba](docs/COMPATIBILITY.md)
 
-Al solicitar explícitamente la reproducción de un enlace, el motor puede consultar servicios externos de metadatos, DNS, trackers y pares para resolverlo. Esas conexiones son distintas de descargar un listado de canales; no verifican que el contenido tenga autorización y pueden comunicar la IP y el identificador del enlace a terceros.
+## Uso responsable y código
+
+Añade únicamente contenido cuya reproducción y, cuando corresponda, redistribución estén autorizadas. Tú eres responsable de los enlaces que utilizas. Al reproducir, el motor puede consultar metadatos, DNS, trackers y pares. P2P puede compartir tu dirección IP y el identificador del enlace con terceros. [Uso responsable](docs/RESPONSIBLE_USE.md)
+
+AC TV es un proyecto independiente publicado bajo AGPL-3.0-or-later. [Licencia](LICENSE) · [Compilación](docs/BUILD.md) · [Cómo contribuir](CONTRIBUTING.md)
