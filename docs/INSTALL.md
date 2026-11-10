@@ -47,7 +47,7 @@ Consulta la [compatibilidad y el estado de las pruebas](COMPATIBILITY.md).
 
 ## Primer uso
 
-La aplicación empieza sin canales. En **Ajustes → Añadir un canal**, introduce un enlace Ace Stream individual compatible, asigna un nombre y elige guardarlo o reproducirlo. Los canales guardados y favoritos permanecen en la TV y se buscan localmente. M3U no está implementado. Añade únicamente contenido autorizado bajo tu responsabilidad; detalles en [Uso responsable](RESPONSIBLE_USE.md).
+La aplicación empieza sin canales. En **Ajustes** puedes añadir un enlace Ace Stream individual o importar una lista M3U con varios enlaces compatibles. Los canales guardados y favoritos permanecen en la TV y se buscan localmente. Añade únicamente contenido autorizado bajo tu responsabilidad. [Importar una lista](LIBRARY.md#importar-una-lista-m3u) · [Uso responsable](RESPONSIBLE_USE.md)
 
 La compatibilidad de formato no garantiza que el enlace esté disponible o se reproduzca. El uso P2P puede comunicar tu IP a otros pares.
 

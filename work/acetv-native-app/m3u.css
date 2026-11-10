@@ -1,0 +1,55 @@
+#import-m3u { margin-inline-start: 0.5rem; }
+
+#m3u-dialog {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(6, 9, 15, 0.9);
+  color: #f1f5ff;
+}
+
+#m3u-dialog[hidden] { display: none; }
+
+.m3u-card {
+  width: min(760px, 100%);
+  max-height: 100%;
+  overflow: auto;
+  padding: clamp(16px, 4vh, 36px);
+  border: 1px solid #2c374d;
+  border-radius: 24px;
+  background: #151e2d;
+}
+
+.m3u-card h1 { margin: 8px 0; font-size: clamp(28px, 5vh, 52px); }
+.m3u-card p { margin: 8px 0 16px; }
+#m3u-content label { display: block; margin: 12px 0 6px; }
+
+#m3u-text {
+  box-sizing: border-box;
+  width: 100%;
+  height: clamp(90px, 22vh, 240px);
+  resize: none;
+  padding: 12px;
+  background: #0d1421;
+  color: inherit;
+  border: 1px solid #536179;
+  border-radius: 10px;
+  font: inherit;
+}
+
+#m3u-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+#m3u-dialog button:focus, #m3u-text:focus { outline: 3px solid #a0ff32; outline-offset: 3px; }
+#m3u-dialog button:disabled { opacity: 0.5; }
+#m3u-message { color: #c8e99f; min-height: 1.2em; }
+
+.m3u-summary {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px 24px;
+  margin: 18px 0;
+}
+
+.m3u-summary dd { margin: 0; font-weight: bold; }

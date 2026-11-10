@@ -1,6 +1,6 @@
 # Uso responsable
 
-AC TV es un reproductor. La versión pública empieza vacía: no proporciona un directorio de canales ni importa directorios de canales de Internet o de un ordenador. Tú añades enlaces compatibles de forma individual en **Ajustes → Añadir un canal**, les asignas un nombre y eliges guardarlos o reproducirlos.
+AC TV es un reproductor y la versión pública empieza con la biblioteca vacía. Puedes añadir enlaces compatibles uno a uno o importar una lista M3U que aportes tú. La importación procesa el archivo o texto localmente. La conexión con los emisores se inicia al elegir un canal. [Cómo importar una lista](LIBRARY.md#importar-una-lista-m3u)
 
 Añade y utiliza únicamente enlaces cuya reproducción y, cuando corresponda, redistribución estén autorizadas en tu jurisdicción. Tú eres responsable de los enlaces y del uso que hagas de ellos. Guardar un canal lo conserva localmente en la TV; los favoritos también se almacenan allí y la búsqueda se hace sobre esos canales guardados.
 

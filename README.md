@@ -5,7 +5,7 @@
 <p align="center">Reproductor experimental de enlaces Ace Stream para Samsung Tizen. Una vez instalado, el motor integrado reproduce desde la tele con AVPlay.</p>
 
 <p align="center">
-  <img alt="Versión pública 0.12.0" src="https://img.shields.io/badge/versión-0.12.0-A0FF32?labelColor=182016">
+  <img alt="Versión pública 0.13.0" src="https://img.shields.io/badge/versi%C3%B3n-0.13.0-A0FF32?labelColor=182016">
   <img alt="Samsung Tizen" src="https://img.shields.io/badge/Samsung-Tizen-91B8DF?labelColor=182016">
   <a href="LICENSE"><img alt="Licencia AGPL 3.0" src="https://img.shields.io/badge/licencia-AGPL--3.0-CCCCCC?labelColor=182016"></a>
 </p>
@@ -18,7 +18,7 @@
 
 | Añade tus enlaces | Encuentra lo que guardaste | Reproduce con el mando |
 | --- | --- | --- |
-| Guarda enlaces compatibles con el nombre que quieras. Puedes corregir el enlace o cambiar el nombre más tarde. | Busca por nombre, ordena tus favoritos y vuelve a los últimos 12 canales reproducidos. | Navega con las flechas, abre con **OK** y cambia de canal con **CH+/CH−**. |
+| Guarda un enlace o importa varios desde una lista M3U de Ace Stream. Puedes cambiar el nombre o el enlace más tarde. | Busca por nombre, ordena tus favoritos y vuelve a los últimos 12 canales reproducidos. | Navega con las flechas, abre con **OK** y cambia de canal con **CH+/CH−**. |
 
 La app guarda la biblioteca y recuerda tu última selección en la tele. [Ver la guía de canales y favoritos](docs/LIBRARY.md)
 
@@ -26,7 +26,7 @@ La app guarda la biblioteca y recuerda tu última selección en la tele. [Ver la
 
 1. **Prepara la TV y el ordenador.** Activa el modo desarrollador, conecta ambos a la misma red y prepara un perfil de firma Samsung válido para tu televisor.
 2. **Comprueba la conexión e instala.** El instalador separa el diagnóstico con `-Diagnose` de la firma e instalación.
-3. **Añade tu primer enlace.** En la TV, abre **Ajustes → Añadir un canal**, ponle un nombre y elige **Guardar** o **Reproducir**.
+3. **Crea tu biblioteca.** En la TV, abre **Ajustes** para añadir un canal o importar una lista M3U de enlaces Ace Stream.
 
 | Elige cómo instalar | |
 | --- | --- |
@@ -57,9 +57,9 @@ La app guarda la biblioteca y recuerda tu última selección en la tele. [Ver la
 
 **¿Tengo que dejar el PC encendido?** El ordenador se usa para instalar. El motor de reproducción funciona en la TV.
 
-**¿De dónde salen los canales?** Tú añades los enlaces uno a uno. La búsqueda recorre tus canales guardados. La importación de listas M3U está pendiente.
+**¿Qué listas M3U admite?** Puedes pegar el texto o seleccionar un archivo `.m3u` o `.m3u8`. Se añaden las entradas Ace Stream compatibles, se omiten los duplicados y los enlaces IPTV o HLS genéricos, y se conservan tus favoritos. [Cómo importar una lista](docs/LIBRARY.md#importar-una-lista-m3u)
 
-**¿Qué modelos están comprobados?** La base del motor se probó en Tizen 6.5. La versión pública 0.12.0 se comprobó en escritorio y su instalación física sigue pendiente de verificar. [Consultar compatibilidad o compartir una prueba](docs/COMPATIBILITY.md)
+**¿Qué modelos están comprobados?** La base del motor se probó en Tizen 6.5. La instalación física de esta versión pública sigue pendiente de verificar. [Consultar compatibilidad o compartir una prueba](docs/COMPATIBILITY.md)
 
 ## Uso responsable y código
 

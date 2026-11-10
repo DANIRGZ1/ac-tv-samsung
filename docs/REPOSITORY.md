@@ -8,4 +8,4 @@ Temas sugeridos: samsung, tizen, smart-tv, acestream, p2p, webassembly, avplay.
 
 La portada del README es `docs/images/cover.png`; la galería enlaza a `docs/GALLERY.md`. La descripción y la vista previa social son ajustes separados de GitHub.
 
-La versión pública empieza sin catálogo y no ofrece búsqueda de directorios externos ni importación de catálogo desde PC. No incluye logos de canales ni material promocional de TV de pago. Consulta [Uso responsable](RESPONSIBLE_USE.md).
+La versión pública empieza con la biblioteca vacía. Las listas M3U que aporta el usuario se procesan localmente. Las capturas de demostración usan nombres genéricos. [Uso responsable](RESPONSIBLE_USE.md)

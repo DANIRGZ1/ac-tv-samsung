@@ -2,6 +2,16 @@
 
 Abre **Opciones**, junto a Ver canal y Añadir a favoritos. Funciona con las flechas, OK y Atrás.
 
+## Importar una lista M3U
+
+1. Ve a **Ajustes → Importar lista M3U**.
+2. Selecciona un archivo local `.m3u` o `.m3u8` si la TV ofrece el selector, o pega el texto de la lista.
+3. Revisa la vista previa y confirma **Importar**. Los canales nuevos se añaden al final de tu biblioteca. Los nombres de los canales que ya tienes, sus favoritos y su historial se conservan.
+
+Se admiten listas de hasta 2 MiB con enlaces Ace Stream compatibles. El importador recoge el nombre y el grupo cuando están indicados, y omite las entradas no compatibles, como las URL genéricas de IPTV y HLS. Puedes ver el recuento de entradas omitidas antes de guardar. La biblioteca admite hasta 5000 canales.
+
+El archivo se lee en la TV y se importa como una copia local. Los cambios posteriores en el archivo requieren volver a importarlo. [Uso responsable](RESPONSIBLE_USE.md)
+
 ## Recientes
 
 Muestra hasta 12 canales después de que empiece la reproducción. Un enlace que falla al cargar no se añade. Pulsa OK sobre un reciente para abrirlo. Pausar y reanudar no crea duplicados. El historial permanece en esta TV.
