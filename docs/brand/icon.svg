@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-labelledby="title">
+  <title id="title">AC TV</title>
+  <defs>
+    <radialGradient id="background" cx="70%" cy="20%" r="90%">
+      <stop stop-color="#263b18"/>
+      <stop offset="1" stop-color="#0b100d"/>
+    </radialGradient>
+  </defs>
+  <rect width="512" height="512" rx="104" fill="url(#background)"/>
+  <rect x="3" y="3" width="506" height="506" rx="101" fill="none" stroke="#33462b" stroke-width="6"/>
+  <path d="M12 19a4 4 0 0 1 6-3.5l37 21a4 4 0 0 1 0 7l-37 21A4 4 0 0 1 12 61Z" transform="translate(130 45) scale(3.8)" fill="#a0ff32"/>
+  <text x="256" y="380" text-anchor="middle" fill="#f1f6ed" font-family="Arial, sans-serif" font-size="96" font-weight="800" letter-spacing="-4">AC TV</text>
+</svg>

@@ -5,7 +5,7 @@
 <p align="center">Reproductor experimental de enlaces Ace Stream para Samsung Tizen. Una vez instalado, el motor integrado reproduce desde la tele con AVPlay.</p>
 
 <p align="center">
-  <img alt="Versión pública 0.13.0" src="https://img.shields.io/badge/versi%C3%B3n-0.13.0-A0FF32?labelColor=182016">
+  <img alt="Versión pública 0.13.1" src="https://img.shields.io/badge/versi%C3%B3n-0.13.1-A0FF32?labelColor=182016">
   <img alt="Samsung Tizen" src="https://img.shields.io/badge/Samsung-Tizen-91B8DF?labelColor=182016">
   <a href="LICENSE"><img alt="Licencia AGPL 3.0" src="https://img.shields.io/badge/licencia-AGPL--3.0-CCCCCC?labelColor=182016"></a>
 </p>
@@ -66,3 +66,9 @@ La app guarda la biblioteca y recuerda tu última selección en la tele. [Ver la
 Añade únicamente contenido cuya reproducción y, cuando corresponda, redistribución estén autorizadas. Tú eres responsable de los enlaces que utilizas. Al reproducir, el motor puede consultar metadatos, DNS, trackers y pares. P2P puede compartir tu dirección IP y el identificador del enlace con terceros. [Uso responsable](docs/RESPONSIBLE_USE.md)
 
 AC TV es un proyecto independiente publicado bajo AGPL-3.0-or-later. [Licencia](LICENSE) · [Compilación](docs/BUILD.md) · [Cómo contribuir](CONTRIBUTING.md)
+
+| Si buscas… | Dónde mirar |
+| --- | --- |
+| Cambios entre versiones | [Historial](CHANGELOG.md) |
+| Ayuda con la instalación, M3U o el mando | [Solución de problemas](docs/TROUBLESHOOTING.md) |
+| Cómo reportar un fallo de seguridad | [Política de seguridad](SECURITY.md) |

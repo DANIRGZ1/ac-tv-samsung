@@ -1,4 +1,4 @@
-Ace TV 0.13.0 — TV-local P2P receiver
+Ace TV 0.13.1 — TV-local P2P receiver
 The Ace TV receiver additions and acetv-wire-wasm are provided under AGPL-3.0-or-later.
 This application includes ace-wire from Outpace by jamezrin and contributors (AGPL-3.0-or-later), commit dba774d870e08d2778748196e145455c74f22152.
 Corresponding source, Cargo.lock, modifications and build scripts are available in the AC TV public repository.

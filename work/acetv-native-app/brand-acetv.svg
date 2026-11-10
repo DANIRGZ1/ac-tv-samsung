@@ -1,1 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="600" height="200" viewBox="0 0 600 200"><defs><linearGradient id="a" x1="0" x2="1" y1="0" y2="1"><stop stop-color="#84e5ff"/><stop offset="1" stop-color="#a494ff"/></linearGradient></defs><path d="M32 155 78 42Q84 28 95 42l47 113h-28l-13-33H72l-13 33Z" fill="url(#a)"/><path d="m82 72 29 23-29 23Z" fill="#101c38"/><text x="162" y="139" font-family="Arial,sans-serif" font-size="96" font-weight="700" letter-spacing="-4" fill="#f3f7ff">ACE<tspan dx="17" font-weight="400" fill="#a8baff">TV</tspan></text></svg>
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="80" viewBox="0 0 256 80" role="img" aria-labelledby="title">
+  <title id="title">AC TV</title>
+  <path d="M12 19a4 4 0 0 1 6-3.5l37 21a4 4 0 0 1 0 7l-37 21A4 4 0 0 1 12 61Z" fill="#a0ff32"/>
+  <text x="73" y="58" fill="#f1f6ed" font-family="Arial, sans-serif" font-size="54" font-weight="800" letter-spacing="-2">AC TV</text>
+</svg>

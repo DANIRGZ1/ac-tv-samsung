@@ -12,3 +12,5 @@ En la BU8500 se verificó la vista previa, la cancelación con Atrás, la import
 Si la instalación falla, empieza por el [diagnóstico de conexión](INSTALL.md#2-diagnosticar-la-conexión-con-la-tv). Si llegas a reproducir vídeo, comprueba también el sonido y que la imagen ocupe la pantalla.
 
 Puedes compartir el resultado en [GitHub Issues](https://github.com/DANIRGZ1/ac-tv-samsung/issues/new/choose). Indica el modelo comercial, la versión de software de la TV, la versión de AC TV y hasta qué paso llegaste. Omite números de serie, direcciones IP, certificados, enlaces Ace Stream y listas personales.
+
+Para resolver fallos habituales, consulta la [guía de solución de problemas](TROUBLESHOOTING.md).
