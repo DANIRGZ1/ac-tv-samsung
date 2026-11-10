@@ -59,7 +59,7 @@ La app guarda la biblioteca y recuerda tu última selección en la tele. [Ver la
 
 **¿Qué listas M3U admite?** Puedes pegar el texto o seleccionar un archivo `.m3u` o `.m3u8`. Se añaden las entradas Ace Stream compatibles, se omiten los duplicados y los enlaces IPTV o HLS genéricos, y se conservan tus favoritos. [Cómo importar una lista](docs/LIBRARY.md#importar-una-lista-m3u)
 
-**¿Qué modelos están comprobados?** La base del motor se probó en Tizen 6.5. La instalación física de esta versión pública sigue pendiente de verificar. [Consultar compatibilidad o compartir una prueba](docs/COMPATIBILITY.md)
+**¿Qué modelos están comprobados?** Instalamos la versión pública 0.13.0 y probamos la importación M3U en una Samsung BU8500 de 2022. [Consultar compatibilidad o compartir una prueba](docs/COMPATIBILITY.md)
 
 ## Uso responsable y código
 
