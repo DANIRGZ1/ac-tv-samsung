@@ -5,7 +5,7 @@
 <p align="center">Reproductor experimental de enlaces Ace Stream para Samsung Tizen. Una vez instalado, el motor integrado reproduce desde la tele con AVPlay.</p>
 
 <p align="center">
-  <img alt="Versión pública 0.13.1" src="https://img.shields.io/badge/versi%C3%B3n-0.13.1-A0FF32?labelColor=182016">
+  <img alt="Versión pública 0.13.2" src="https://img.shields.io/badge/versi%C3%B3n-0.13.2-A0FF32?labelColor=182016">
   <img alt="Samsung Tizen" src="https://img.shields.io/badge/Samsung-Tizen-91B8DF?labelColor=182016">
   <a href="LICENSE"><img alt="Licencia AGPL 3.0" src="https://img.shields.io/badge/licencia-AGPL--3.0-CCCCCC?labelColor=182016"></a>
 </p>

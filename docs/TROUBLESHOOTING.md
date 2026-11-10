@@ -12,7 +12,7 @@ Esta guía reúne comprobaciones breves. Para instalar desde cero, sigue la [gu�
 ## Un canal no carga o no se oye
 
 - La biblioteca solo guarda enlaces compatibles; guardarlo no confirma que el emisor siga disponible ni que la TV admita su formato.
-- Prueba otro enlace que tengas derecho a reproducir. Comprueba que la TV tenga conexión de red y espera a que termine el búfer.
+- Comprueba que la TV tenga conexión de red. Si el canal no abre en un minuto, usa **Reintentar** o pulsa **Atrás** para volver a la lista. **Probar otro enlace** aparece si tienes un segundo enlace guardado con el mismo nombre.
 - La reproducción inicia conexiones externas y P2P puede comunicar tu IP a otros pares. Revisa [uso responsable y privacidad](RESPONSIBLE_USE.md).
 - La reproducción física de la versión pública aún no está verificada en todos los modelos. Consulta el estado por modelo en [Compatibilidad](COMPATIBILITY.md).
 

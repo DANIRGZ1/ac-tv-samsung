@@ -1,5 +1,10 @@
 # Historial de versiones
 
+## 0.13.2
+
+- La apertura muestra el nombre del canal y permite volver al catálogo con **Atrás**.
+- Si el reproductor no puede arrancar en un minuto, aparece **Reintentar**. Si hay otro enlace guardado con el mismo nombre, también aparece **Probar otro enlace**.
+
 ## 0.13.1
 
 - El icono del menú de Samsung y el logotipo de ajustes usan el triángulo verde de AC TV.
