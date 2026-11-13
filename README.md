@@ -2,10 +2,10 @@
 
 <h1 align="center">AC TV para Samsung</h1>
 <p align="center"><strong>Tus enlaces, tus favoritos y el mando de tu Samsung.</strong></p>
-<p align="center">Reproductor experimental de enlaces Ace Stream para Samsung Tizen. Una vez instalado, el motor integrado reproduce desde la tele con AVPlay.</p>
+<p align="center">Beta abierta de un reproductor de enlaces Ace Stream para Samsung Tizen. Una vez instalado, el motor integrado reproduce desde la tele con AVPlay.</p>
 
 <p align="center">
-  <img alt="Versión pública 0.14.1" src="https://img.shields.io/badge/versi%C3%B3n-0.14.1-A0FF32?labelColor=182016">
+  <img alt="Versión pública 0.15.0" src="https://img.shields.io/badge/versi%C3%B3n-0.15.0-A0FF32?labelColor=182016">
   <img alt="Samsung Tizen" src="https://img.shields.io/badge/Samsung-Tizen-91B8DF?labelColor=182016">
   <a href="LICENSE"><img alt="Licencia AGPL 3.0" src="https://img.shields.io/badge/licencia-AGPL--3.0-CCCCCC?labelColor=182016"></a>
 </p>
@@ -34,6 +34,10 @@ La app guarda la biblioteca y recuerda tu última selección en la tele. [Ver la
 | **Con Claude Code** | [Tutorial desde el ordenador de tu red local](docs/INSTALL_WITH_CLAUDE.md) |
 | **Manual** | [Requisitos, diagnóstico y comandos](docs/INSTALL.md) |
 
+## Prueba la beta
+
+Comprueba si puedes instalar, importar una lista M3U de prueba y navegar con el mando. Si pruebas la reproducción, usa un enlace autorizado y comprueba la imagen, el sonido y la opción de volver al catálogo con **Atrás**. Comparte el modelo, la versión de software y el paso que has podido comprobar. [Plantilla de compatibilidad](.github/ISSUE_TEMPLATE/compatibilidad.md) · [Resultados verificados](docs/COMPATIBILITY.md)
+
 ## Galería
 
 ![Pantalla de inicio de AC TV](docs/images/home.png)
@@ -59,7 +63,7 @@ La app guarda la biblioteca y recuerda tu última selección en la tele. [Ver la
 
 **¿Qué listas M3U admite?** Puedes pegar el texto o seleccionar un archivo `.m3u` o `.m3u8`. Se añaden las entradas Ace Stream compatibles, se omiten los duplicados y los enlaces IPTV o HLS genéricos, y se conservan tus favoritos. [Cómo importar una lista](docs/LIBRARY.md#importar-una-lista-m3u)
 
-**¿Qué modelos están comprobados?** Instalamos la versión pública 0.13.0 y probamos la importación M3U en una Samsung BU8500 de 2022. [Consultar compatibilidad o compartir una prueba](docs/COMPATIBILITY.md)
+**¿Qué modelos están comprobados?** La Samsung BU8500 de 2022 es el modelo de referencia. Las pruebas se detallan por versión. [Consultar compatibilidad o compartir una prueba](docs/COMPATIBILITY.md)
 
 ## Uso responsable y código
 

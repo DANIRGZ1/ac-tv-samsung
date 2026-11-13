@@ -41,6 +41,7 @@
 }
 
 #m3u-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+#m3u-actions button { min-width: 0; max-width: 100%; line-height: 1.25; white-space: normal; word-wrap: break-word; overflow-wrap: anywhere; }
 #m3u-dialog button:focus, #m3u-text:focus { outline: 3px solid #a0ff32; outline-offset: 3px; }
 #m3u-dialog button:disabled { opacity: 0.5; }
 #m3u-message { color: #c8e99f; min-height: 1.2em; }

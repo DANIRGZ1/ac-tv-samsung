@@ -55,4 +55,4 @@ Antes de ejecutarlo, confirma que este comando instala la app pública AcTVPubli
 
 La app empieza sin canales. Añade únicamente enlaces de contenido que tengas autorización para usar. Consulta [Instalación y primer uso](INSTALL.md) y [Uso responsable](RESPONSIBLE_USE.md).
 
-La instalación física de la versión pública no se ha verificado en una TV real. Si hay errores de conexión o firma, revisa [INSTALL.md](INSTALL.md) y la [guía oficial de conexión de Samsung](https://developer.samsung.com/smarttv/develop/getting-started/using-sdk/tv-device.html).
+Consulta los [modelos probados y el alcance de las pruebas](COMPATIBILITY.md). Si hay errores de conexión o firma, revisa [INSTALL.md](INSTALL.md) y la [guía oficial de conexión de Samsung](https://developer.samsung.com/smarttv/develop/getting-started/using-sdk/tv-device.html).

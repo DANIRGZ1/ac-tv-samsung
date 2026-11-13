@@ -8,7 +8,7 @@ Desde la raíz del repositorio:
 pwsh -File work/build-native-app.ps1
 ```
 
-El resultado es un WGT sin firmar. Para firmar e instalar necesitas Tizen Studio, extensiones Samsung y certificados propios válidos para el televisor. No se incluyen claves ni perfiles. Consulta [Instalación](INSTALL.md).
+El resultado es un WGT sin firmar en la carpeta `work`. El script empaqueta los archivos de la versión sin sobrescribir el motor ni usar certificados. Para firmar e instalar necesitas Tizen Studio, extensiones Samsung y certificados propios válidos para el televisor. No se incluyen claves ni perfiles. Consulta [Instalación](INSTALL.md).
 
 La reconstrucción de componentes requiere Rust nightly-2026-03-15, wasm-bindgen 0.2.105 y el SDK WebAssembly de Samsung compatible con sockets Tizen. El SDK no se redistribuye. Los scripts `work/build-wire-probe.ps1` y `work/build-live-probe.ps1` describen las rutas de reconstrucción.
 

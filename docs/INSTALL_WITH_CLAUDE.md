@@ -61,4 +61,4 @@ El parámetro `-Install` firma e instala la app incluida con tu perfil; `-Launch
 
 La app empieza sin canales. Añade solo enlaces de contenido que tengas autorización para usar. Consulta [Instalación y primer uso](INSTALL.md) y [Uso responsable](RESPONSIBLE_USE.md).
 
-La versión pública no se ha verificado instalada en una TV real. Para errores de firma o conexión, revisa [INSTALL.md](INSTALL.md) y la [documentación oficial de Samsung sobre conexión de la TV](https://developer.samsung.com/smarttv/develop/getting-started/using-sdk/tv-device.html).
+Consulta los [modelos probados y el alcance de las pruebas](COMPATIBILITY.md). Para errores de firma o conexión, revisa [INSTALL.md](INSTALL.md) y la [documentación oficial de Samsung sobre conexión de la TV](https://developer.samsung.com/smarttv/develop/getting-started/using-sdk/tv-device.html).

@@ -22,7 +22,7 @@ function createApp(favorites, cacheValue, response, options) {
   function element(tag, owner) {
     var e = { tagName: tag.toUpperCase(), id: '', value: '', hidden: false, disabled: false, className: '', children: [], attributes: {}, style: {},
       offsetTop: 0, offsetHeight: 40, scrollTop: 0, clientHeight: 500,
-      appendChild: function (child) { child.parent = this; this.children.push(child); return child; },
+      appendChild: function (child) { if(child.tagName==='#FRAGMENT'){child.children.slice().forEach(this.appendChild.bind(this));child.children=[];return child;} child.parent = this; this.children.push(child); return child; },
       setAttribute: function (n, v) { this.attributes[n] = String(v); }, getAttribute: function (n) { return this.attributes[n] || null; },
       focus: function () { owner.activeElement = this; if (this.onfocus) this.onfocus(); },
       click: function () { if (this.onclick) this.onclick(); }, blur: function () { if (owner.activeElement === this) owner.activeElement = null; },
@@ -35,7 +35,7 @@ function createApp(favorites, cacheValue, response, options) {
   }
   var document = { activeElement: null, documentElement: { clientWidth: 1920, clientHeight: 1080 }, getElementById: function (id) { return elements[id] || null; },
     body: null, createElement: function (tag) { var n = element(tag, document), append = n.appendChild; n.appendChild = function (child) { append.call(n, child); if (child.id) elements[child.id] = child; return child; }; return n; },
-    addEventListener: function () {} };
+    createDocumentFragment: function () { return element('#fragment', document); }, addEventListener: function () {} };
   document.body = element('body', document);
   ['engine', 'source', 'explore', 'backguide', 'import-pc'].forEach(function (id) { var n = element('input', document); n.id = id; elements[id] = n; });
   elements.engine.value = 'http://127.0.0.1:6878';

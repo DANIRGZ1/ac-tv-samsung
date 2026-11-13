@@ -1,5 +1,12 @@
 # Historial de versiones
 
+## 0.15.0
+
+- Primera beta abierta para quienes quieran probar AC TV en su Samsung.
+- Menús y tarjetas más ligeros, con fondos comprimidos, reutilización de la página al volver de Ajustes y caché de búsquedas recientes.
+- Saltos de página con el mando, acceso directo a enlaces alternativos, búsqueda más fácil de corregir y etiquetas largas que pueden ocupar varias líneas.
+- El empaquetado usa exactamente el motor incluido en el código de la versión.
+
 ## 0.14.1
 
 - La tarjeta de Samsung usa el mismo logotipo horizontal que aparece dentro de AC TV.
