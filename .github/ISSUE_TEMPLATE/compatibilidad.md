@@ -1,22 +1,45 @@
 ---
-name: Problema o prueba de compatibilidad
-about: Comparte el resultado de instalar o probar AC TV en un televisor Samsung.
-title: "[Tizen] "
+name: Compatibilidad con TV
+about: Informa de una prueba de instalación, mando, M3U o reproducción en un televisor
+title: "[Compatibilidad] "
 ---
 
-<!-- Omite IP, número de serie, DUID, certificados, listas y enlaces de reproducción. -->
+## Televisor y aplicación
 
-### Equipo
+- **Fabricante y modelo comercial** (por ejemplo, Samsung BU8500):
+- **Año/modelo exacto** (si lo conoces; no incluyas el número de serie):
+- **Versión de Tizen/software de la TV:**
+- **Versión de AC TV:**
+- **Fecha de la prueba:**
 
-- Modelo comercial de la TV:
-- Versión de software/Tizen, si aparece en la TV:
-- Versión de AC TV o commit:
-- Sistema operativo del ordenador (si es un problema de instalación):
+## Qué probaste
 
-### Resultado
+Marca lo que corresponda y añade el resultado:
 
-Indica qué probaste y hasta dónde llegaste: comprobación local, diagnóstico de conexión, firma, instalación, apertura o reproducción. Si hubo un error, incluye el mensaje sin datos personales.
+- [ ] Instalación física en la TV
+- [ ] Navegación con el mando (indica botones y pantalla):
+- [ ] Importación M3U pegando texto
+- [ ] Importación M3U desde una memoria USB física
+- [ ] Inicio de reproducción P2P
+- [ ] Reproducción P2P continua (duración aproximada):
+- [ ] Prueba en navegador de escritorio o SDK simulado (indica cuál; no es prueba física de TV)
 
-### Pasos para reproducirlo
+**Resultado:**
 
-Si estás reportando un fallo, explica qué pasos lo provocan y qué esperabas que sucediera.
+**Pasos para reproducir el problema o la prueba:**
+
+1.
+2.
+3.
+
+**Resultado esperado:**
+
+**Resultado obtenido / mensaje de error:**
+
+## Datos adicionales
+
+- ¿Se repite después de cerrar y abrir la app?:
+- ¿Ocurre con otra lista o enlace de prueba?:
+- Registro o captura redactados (opcional):
+
+Antes de publicar, elimina números de serie, direcciones IP, certificados, enlaces Ace Stream y listas M3U personales. No adjuntes credenciales ni datos privados.
