@@ -28,7 +28,10 @@
           if(!/^http:\/\/127\.0\.0\.1:([0-9]{1,5})\/[a-f0-9]{32}\.ts$/.test(d.url))return failure('Dirección local no válida');
           clearTimeout(deadline);last.state='streaming';if(!settled){settled=true;pendingReject=null;resolve(d.url)}
         }else if(d.type==='media-progress'){last.verifiedPieces=d.verifiedPieces;last.receivedMediaBytes=d.bytes;last.localBuffered=d.localBuffered}
-        else if(d.type==='result'&&!d.ok)failure('El emisor dejó de responder. Vuelve a abrir el canal.');
+        else if(d.type==='result'&&!d.ok){
+          if(typeof d.error==='string'&&/No reachable peer in tracker results|No peers found/i.test(d.error))failure('No se encontró un emisor disponible para este enlace.');
+          else failure('El emisor dejó de responder. Vuelve a abrir el canal.');
+        }
         else if(d.type==='transport-error')failure('No se pudo iniciar el motor de la TV.');
         else if(onProgress)onProgress(d);
       }

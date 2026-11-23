@@ -5,7 +5,7 @@
 <p align="center">Beta abierta de un reproductor de enlaces Ace Stream para Samsung Tizen. Una vez instalado, el motor integrado reproduce desde la tele con AVPlay.</p>
 
 <p align="center">
-  <img alt="Versión pública 0.15.0" src="https://img.shields.io/badge/versi%C3%B3n-0.15.0-A0FF32?labelColor=182016">
+  <img alt="Versión pública 0.15.1" src="https://img.shields.io/badge/versi%C3%B3n-0.15.1-A0FF32?labelColor=182016">
   <img alt="Samsung Tizen" src="https://img.shields.io/badge/Samsung-Tizen-91B8DF?labelColor=182016">
   <a href="LICENSE"><img alt="Licencia AGPL 3.0" src="https://img.shields.io/badge/licencia-AGPL--3.0-CCCCCC?labelColor=182016"></a>
 </p>
@@ -20,7 +20,7 @@
 | --- | --- | --- |
 | Guarda un enlace o importa varios desde una lista M3U de Ace Stream. Puedes cambiar el nombre o el enlace más tarde. | Busca por nombre, ordena tus favoritos y vuelve a los últimos 12 canales reproducidos. | Navega con las flechas, abre con **OK** y cambia de canal con **CH+/CH−**. |
 
-La app guarda la biblioteca y recuerda tu última selección en la tele. [Ver la guía de canales y favoritos](docs/LIBRARY.md)
+**Nuevo en 0.15.1.** AC TV muestra el progreso de conexión, puede probar una fuente alternativa guardada cuando falla la principal y guarda una copia de la biblioteca tras actualizar. [Ver la guía de canales y favoritos](docs/LIBRARY.md)
 
 ## Instalación
 

@@ -4,15 +4,44 @@ var root, active=false, full=false, page=0, total=0;
 var rows=[], items=[], sourceItems=[], cachedItems=[], localResults=[], index=0, query='', sport=false, onlyFavorites=false;
 var homeMode=true,genre='';
 var indexedChannels=null,channelsById=null,channelsByName=null;
+var holdTimer=null,heldCard=null,holdOpened=false,focusIndicator=null;
+var previousFocus=null,heroLogo=null;
 var selectedRow=null,channelKeys=new WeakMap(),searchNames=new WeakMap();
-var favoriteIndex=null,resultCache=[],visiblePage=null,rendered=null;
+var favoriteIndex=null,resultCache=[],visiblePage=null,rendered=null,renderCache=[];
 var viewportWidth=0,viewportHeight=0;
 var PAGE_SIZE=50, MAX_CACHED_VIEWS=4;
-function addChannel(name,value){var parsed=AceCore.parse(String(value||'').trim()),title=cleanText(name,120).trim();if(!parsed||!title)return {ok:false,message:'Escribe un nombre y un enlace Ace Stream compatible.'};var existing=cachedItems.find(function(i){return i.id===parsed.id;});if(existing){if((existing.kind||'infohash')!==parsed.kind)return {ok:false,message:'Este identificador ya existe con otro tipo de enlace. No se ha guardado ni cambiado el canal anterior.'};return {ok:true,message:'Este enlace ya está guardado.'};}if(cachedItems.length>=CHANNEL_CACHE_LIMIT)return {ok:false,message:'La lista de canales está llena.'};var item={id:parsed.id,name:title,kind:parsed.kind};var previous=cachedItems;cachedItems=normalizeChannels(cachedItems.concat([item]));if(!persistChannels()){cachedItems=previous;return {ok:false,message:'No se ha podido guardar el canal. Comprueba el espacio disponible.'};}return {ok:true,message:'Canal guardado en esta TV.'};}
+function invalidateCatalogViews(){
+  indexedChannels=null;channelsById=null;channelsByName=null;favoriteIndex=null;
+  resultCache=[];visiblePage=null;renderCache=[];rendered=null;
+}
+function addChannel(name,value){var parsed=AceCore.parse(String(value||'').trim()),title=cleanText(name,120).trim();if(!parsed||!title)return {ok:false,message:'Escribe un nombre y un enlace Ace Stream compatible.'};var existing=cachedItems.find(function(i){return i.id===parsed.id;});if(existing){if((existing.kind||'infohash')!==parsed.kind)return {ok:false,message:'Este identificador ya existe con otro tipo de enlace. No se ha guardado ni cambiado el canal anterior.'};return {ok:true,message:'Este enlace ya está guardado.'};}if(cachedItems.length>=CHANNEL_CACHE_LIMIT)return {ok:false,message:'La lista de canales está llena.'};var item={id:parsed.id,name:title,kind:parsed.kind};var previous=cachedItems;cachedItems=normalizeChannels(cachedItems.concat([item]));if(!persistChannels()){cachedItems=previous;return {ok:false,message:'No se ha podido guardar el canal. Comprueba el espacio disponible.'};}invalidateCatalogViews();return {ok:true,message:'Canal guardado en esta TV.'};}
 
 var current=null, lastPlayed=null, previousPlayed=null, favorites=[], zapTimer=null, lastSection='guide-home';
 var libraryReady=true,recents=[],cursorTimer=null,initialRestore=true,savedCursor=null;
-try{if(window.LibraryCore)libraryReady=LibraryCore.recover(localStorage);}catch(e){libraryReady=false;}try{if(window.LibraryCore)recents=LibraryCore.normalize(JSON.parse(localStorage.getItem('ace-tv.recent')||'[]'));}catch(e){recents=[];}try{savedCursor=JSON.parse(localStorage.getItem('ace-tv.guide-cursor.v1')||'null');}catch(e){savedCursor=null;}
+var workingLinks=[],workingLinksKey='ace-tv.working-links.v1';
+function workingChannel(item) {
+  var links=channelLinks(item),key=channelKey(item);
+  var last=workingLinks.find(function(link){return channelKey(link)===key;});
+  return last&&links.find(function(link){return link.id===last.id&&(link.kind||'infohash')===(last.kind||'infohash');})||item;
+}
+function rememberWorkingChannel() {
+  if(!current||!libraryReady)return;
+  var key=channelKey(current),last=workingLinks.find(function(link){return channelKey(link)===key;});
+  if(last&&last.id===current.id&&(last.kind||'infohash')===(current.kind||'infohash'))return;
+  var next=[copyChannel(current)].concat(workingLinks.filter(function(link){return channelKey(link)!==key;})).slice(0,12);
+  var changes={};
+  changes[workingLinksKey]=JSON.stringify(next);
+  if(LibraryCore.commit(localStorage,changes))workingLinks=next;
+}
+
+try{if(window.LibraryCore)libraryReady=LibraryCore.recover(localStorage);}catch(e){libraryReady=false;}
+if(libraryReady&&window.AceLibraryRecovery&&window.tizen){
+  try{AceLibraryRecovery.init(tizen.application.getCurrentApplication().appInfo.version);}catch(e){}
+}
+try{if(window.LibraryCore)recents=LibraryCore.normalize(JSON.parse(localStorage.getItem('ace-tv.recent')||'[]'));}catch(e){recents=[];}try{savedCursor=JSON.parse(localStorage.getItem('ace-tv.guide-cursor.v1')||'null');}catch(e){savedCursor=null;}
+try {
+  workingLinks=LibraryCore.normalize(JSON.parse(localStorage.getItem(workingLinksKey)||'[]'));
+} catch(e) {}
 function rememberCursor(){if(initialRestore||!items.length)return;clearTimeout(cursorTimer);cursorTimer=setTimeout(writeCursor,250);}
 function writeCursor(){if(initialRestore||!items.length)return;try{localStorage.setItem('ace-tv.guide-cursor.v1',JSON.stringify({view:homeMode?'home':onlyFavorites?'favorites':sport?'sport':genre||'live',query:query,page:page,id:items[index].id}));}catch(e){}}
 function libraryState(){
@@ -21,7 +50,8 @@ function libraryState(){
     favorites:favoriteCards().map(copyChannel),
     recent:uniqueChannels(recents).map(copyChannel),
     selected:selected?copyChannel(selected):null,
-    links:selected?channelLinks(selected).map(copyChannel):[]
+    links:selected?channelLinks(selected).map(copyChannel):[],
+    workingId:selected?workingChannel(channelCard(selected)).id:null
   };
 }
 function copyChannel(item){return Object.assign({},item);}
@@ -29,20 +59,24 @@ function preferLink(id){
   var item=savedChannel(id);
   if(!item)return {ok:false,message:'Este enlace ya no está guardado.'};
   var links=channelLinks(item);
-  if(links[0].id===id)return {ok:true,message:'Este enlace ya se prueba primero.'};
+
   var ordered=[item].concat(links.filter(function(link){return link.id!==id;}));
   var key=channelKey(item),at=0;
   var channels=cachedItems.map(function(link){return channelKey(link)===key?ordered[at++]:link;});
   var changes={};
   changes[CHANNEL_CACHE_KEY]=JSON.stringify(channels);
+  var nextWorking=workingLinks.filter(function(link){return channelKey(link)!==key;});
+  changes[workingLinksKey]=JSON.stringify(nextWorking);
   if(!libraryReady||!LibraryCore.commit(localStorage,changes))return {ok:false,message:'No se ha podido guardar el enlace preferido.'};
   cachedItems=channels;
+  workingLinks=nextWorking;
+  invalidateCatalogViews();
   libraryRefresh(id);
   return {ok:true,message:'Se probará primero este enlace.'};
 }
-function librarySave(channels,nextFavorites,nextRecents){if(!libraryReady||!window.LibraryCore)return false;var updates={'ace-tv.channels':JSON.stringify(channels),'ace-tv.favorites':JSON.stringify(nextFavorites),'ace-tv.recent':JSON.stringify(nextRecents)};if(!LibraryCore.commit(localStorage,updates))return false;cachedItems=channels;favorites=nextFavorites;recents=nextRecents;return true;}
+function librarySave(channels,nextFavorites,nextRecents){if(!libraryReady||!window.LibraryCore)return false;var updates={'ace-tv.channels':JSON.stringify(channels),'ace-tv.favorites':JSON.stringify(nextFavorites),'ace-tv.recent':JSON.stringify(nextRecents)};if(!LibraryCore.commit(localStorage,updates))return false;cachedItems=channels;favorites=nextFavorites;recents=nextRecents;invalidateCatalogViews();return true;}
 function libraryRefresh(id){load(false,id);if(id)restoreChannelFocus(savedChannel(id));}
-function libraryMove(id,delta){if(!libraryReady||!window.LibraryCore||!favoriteCards().some(function(i){return i.id===id;}))return {ok:false,message:'No se ha podido cambiar el orden.'};var next=LibraryCore.move(favoriteCards(),id,delta);if(!LibraryCore.commit(localStorage,{'ace-tv.favorites':JSON.stringify(next)}))return {ok:false,message:'No se ha podido guardar el orden. Inténtalo de nuevo.'};favorites=next;libraryRefresh(id);return {ok:true,message:'Orden de favoritos guardado.'};}
+function libraryMove(id,delta){if(!libraryReady||!window.LibraryCore||!favoriteCards().some(function(i){return i.id===id;}))return {ok:false,message:'No se ha podido cambiar el orden.'};var next=LibraryCore.move(favoriteCards(),id,delta);if(!LibraryCore.commit(localStorage,{'ace-tv.favorites':JSON.stringify(next)}))return {ok:false,message:'No se ha podido guardar el orden. Inténtalo de nuevo.'};favorites=next;invalidateCatalogViews();libraryRefresh(id);return {ok:true,message:'Orden de favoritos guardado.'};}
 function libraryEdit(id,name,source){var item=cachedItems.find(function(i){return i.id===id;}),parsed=AceCore.parse(String(source||'').trim()),title=cleanText(name,120).trim();if(!item||!parsed||!title)return {ok:false,message:'Escribe un nombre y un enlace compatible.'};if(cachedItems.some(function(i){return i.id!==id&&i.id===parsed.id;}))return {ok:false,message:'Ese enlace ya pertenece a otro canal guardado.'};function change(i){if(i.id!==id)return i;var copy=Object.assign({},i,{id:parsed.id,name:title});if(parsed.kind==='content_id')copy.kind='content_id';else delete copy.kind;return copy;}var channels=cachedItems.map(change),next=favorites.map(change),recent=recents.map(change);if(!librarySave(channels,next,recent))return {ok:false,message:'No se han guardado los cambios. Tus datos anteriores se conservan.'};libraryRefresh(parsed.id);return {ok:true,message:'Canal actualizado.'};}
 function libraryDelete(id){
   var item=savedChannel(id);
@@ -121,8 +155,9 @@ function importM3U(text, save){
     return result;
   }
   cachedItems=next;
-  result.message=additions.length===1?'Se añadió un canal a la biblioteca.':'Se añadieron '+additions.length+' canales a la biblioteca.';
+  invalidateCatalogViews();
   if(active)load();
+  result.message=additions.length===1?'Se añadió un canal a la biblioteca.':'Se añadieron '+additions.length+' canales a la biblioteca.';
   return result;
 }
 function normalizeText(value){var text=String(value||'').toLowerCase();try{if(text.normalize)text=text.normalize('NFD').replace(/[\u0300-\u036f]/g,'');}catch(e){}return text;}
@@ -196,9 +231,16 @@ function findChannels(){
   }
   resultCache=resultCache.filter(function(view){return view.source===cachedItems&&view.favorites===favorites;});
   var words=searchWords(query),terms=words.split(' '),compact=words.replace(/\s/g,''),needsMovistar=terms.indexOf('m')>=0;
-  var matches=cachedItems.filter(function(item){return matchesName(item,terms,compact,needsMovistar)&&categoryMatches(item);});
-  var cards=uniqueChannels(matches).map(channelCard);
-  var available=new Set(cards.map(function(card){return card.id;}));
+  indexChannels();
+  var seen=new Set(),available=new Set(),cards=[];
+  cachedItems.forEach(function(item){
+    var key=channelKey(item);
+    if(seen.has(key)||!matchesName(item,terms,compact,needsMovistar)||!categoryMatches(item,key))return;
+    seen.add(key);
+    var card=channelsByName[key][0];
+    cards.push(card);
+    available.add(card.id);
+  });
   var pinned=favoriteCards().filter(function(card){return available.has(card.id);});
   var pinnedIds=new Set(pinned.map(function(card){return card.id;}));
   var result=pinned.concat(cards.filter(function(card){return !pinnedIds.has(card.id);}));
@@ -206,24 +248,26 @@ function findChannels(){
   if(resultCache.length>MAX_CACHED_VIEWS)resultCache.pop();
   return result;
 }
-function categoryMatches(item){
+function categoryMatches(item,name){
   if(!sport&&!genre)return true;
-  var category=normalizeText(item.category),name=normalizeText(item.name);
+  var category=normalizeText(item.category);
   if(sport)return /sport|deport/.test(category)||/futbol|fútbol|campeon|sport|deport/.test(name);
   if(genre==='football')return /football|soccer|futbol/.test(category)||/liga|futbol|football|soccer|champions|campeones/.test(name);
   if(genre==='movies')return /movie|film|cine/.test(category)||/cine|cinema|movie/.test(name);
   if(genre==='news')return /news|notici/.test(category)||/news|notici|24h|informacion/.test(name);
   return true;
 }
-function channelBrand(item,target,lazy){
+function channelBrand(item,target,lazy,knownLogo){
   target.textContent='';
-  var realLogo=window.ChannelLogos&&ChannelLogos.resolve(item&&item.name);
+  var realLogo=knownLogo||window.ChannelLogos&&ChannelLogos.resolve(item&&item.name);
   if(realLogo){
     var image=node('img','','',target,'channel-logo');
     image.alt='';
     if(lazy){image.loading='lazy';image.decoding='async';}
     image.onerror=function(){
+      if(image.parentNode!==target)return;
       target.textContent='';
+      if(knownLogo){target.hidden=true;return;}
       node('span','',item.name,target,'brand-mark brand-generic');
       if(lazy)target.parentNode.classList.remove('with-channel-logo');
     };
@@ -244,16 +288,22 @@ function saved(id) {
   var index=indexFavorites(), item=savedChannel(id);
   return index.ids.has(id)||!!(item&&index.names.has(channelKey(item)));
 }
-function status(text) {
-  if(!root)return;
-  var label=$('guide-status');
+function updateText(id,text) {
+  var label=$(id);
   if(label.textContent!==text)label.textContent=text;
+}
+function status(text) {
+  if(root)updateText('guide-status',text);
 }
 function size(){
   var w=document.documentElement.clientWidth||1920,h=document.documentElement.clientHeight||1080;
   if(!root||w===viewportWidth&&h===viewportHeight)return;
   viewportWidth=w;viewportHeight=h;
-  root.style.transform='scale('+Math.min(w/1920,h/1080)+')';
+  // Samsung's keyboard reduces the web viewport without changing the TV's screen size.
+  var display=window.tizen&&window.screen;
+  var fullWidth=display&&w===display.width&&Math.abs(display.height-w*9/16)<=1;
+  var guideHeight=fullWidth?display.height:h;
+  root.style.transform='scale('+Math.min(w/1920,guideHeight/1080)+')';
   AceTV.setViewport({left:0,top:0,width:w,height:h});
 }
 function fullscreen(value) {
@@ -269,9 +319,10 @@ function playerPhase(phase) {
     if(lastPlayed&&channelKey(lastPlayed)!==channelKey(current))previousPlayed=lastPlayed;
     lastPlayed=current;
     recordRecent();
+    rememberWorkingChannel();
   }
   if(phase==='idle'&&full)setTimeout(function(){
-    if(active&&full&&AceTV.diagnostics().phase==='idle'){
+    if(active&&full&&!document.hidden&&!(AceTV.hasPendingResume&&AceTV.hasPendingResume())&&AceTV.diagnostics().phase==='idle'){
       full=false; root.hidden=false; document.body.classList.add('guide-active'); if(!$('channel-loading')||$('channel-loading').hidden)restoreChannelFocus(current);
     }
   },0);
@@ -286,14 +337,29 @@ function heading(){
   $('guide-page').hidden=homeMode||onlyFavorites;root.classList.toggle('home-view',homeMode);root.classList.toggle('browse-view',!homeMode);$('guide-categories').hidden=!homeMode;
 }
 function details(){
-  var item=items[index],isSaved=!!(item&&saved(item.id)),football=!!(item&&/futbol|fútbol|campeon/i.test(item.name));
-  var title=homeMode?(football?'Tu noche de fútbol':'Tu televisión, a tu manera'):item?item.name:onlyFavorites?'Tus favoritos empiezan aquí':'Encuentra tu próximo canal';
-  $('guide-title').textContent=title;
+  var item=items[index],isSaved=!!(item&&saved(item.id));
+  var title=item?item.name:homeMode?'Tu televisión, a tu manera':onlyFavorites?'Tus favoritos empiezan aquí':'Encuentra tu próximo canal';
+  updateText('guide-title',title);
   $('guide-title').classList.toggle('long-title',title.length>45);
-  $('guide-kicker').textContent='TUS ENLACES';channelBrand(item,$('guide-hero-brand'));$('guide-hero-brand').hidden=!item;
-  $('guide-description').textContent=homeMode?'Tus canales favoritos.':item?'Pulsa Ver canal para reproducirlo.':'Busca por nombre y guarda los canales que más te gustan.';
-  $('guide-links').hidden=!item||channelLinks(item).length<2;
-  $('guide-watch').disabled=!item;$('guide-star').disabled=!item;$('guide-star').textContent=isSaved?'★  Quitar de favoritos':'☆  Añadir a favoritos';$('guide-star').setAttribute('aria-pressed',String(isSaved));$('guide-watch').setAttribute('aria-label',item?'Ver '+item.name:'Ver canal');
+  var logo=item&&window.ChannelLogos&&ChannelLogos.resolve(item.name)||null;
+  if(logo!==heroLogo){
+    var brand=$('guide-hero-brand');
+    if(logo)channelBrand(item,brand,false,logo);
+    else brand.textContent='';
+    brand.hidden=!logo;
+    heroLogo=logo;
+  }
+  updateText('guide-description',homeMode?'Tus canales favoritos.':item?'Pulsa Ver canal para reproducirlo.':'Busca por nombre y guarda los canales que más te gustan.');
+  var links=$('guide-links'),watch=$('guide-watch'),star=$('guide-star');
+  var hideLinks=!item||channelLinks(item).length<2;
+  if(links.hidden!==hideLinks)links.hidden=hideLinks;
+  var disabled=!item;
+  if(watch.disabled!==disabled)watch.disabled=disabled;
+  if(star.disabled!==disabled)star.disabled=disabled;
+  updateText('guide-star',isSaved?'★  Quitar de favoritos':'☆  Añadir a favoritos');
+  var pressed=String(isSaved),label=item?'Ver '+item.name:'Ver canal';
+  if(star.getAttribute('aria-pressed')!==pressed)star.setAttribute('aria-pressed',pressed);
+  if(watch.getAttribute('aria-label')!==label)watch.setAttribute('aria-label',label);
 }
 function select(value) {
   if(!items.length)return;
@@ -312,50 +378,113 @@ function select(value) {
   updateCount();
 }
 function updateCount(){
-  $('guide-count').textContent=homeMode||onlyFavorites?(index+1)+' de '+items.length:
-    (total===1?'1 canal':total+' canales')+' · Página '+(page+1)+' de '+Math.max(1,Math.ceil(total/PAGE_SIZE));
+  updateText('guide-count',homeMode||onlyFavorites?(index+1)+' de '+items.length:
+    (total===1?'1 canal':total+' canales')+' · Página '+(page+1)+' de '+Math.max(1,Math.ceil(total/PAGE_SIZE)));
+}
+function renderSignature(list){
+  var signature=[];
+  list.forEach(function(item){signature.push(item.id,item.name,saved(item.id)?'1':'0');});
+  signature.push('|');
+  favorites.forEach(function(item){signature.push(item.id,item.name);});
+  return signature.join('\u001f');
+}
+function showCardFocus(row){
+  if(!focusIndicator)return;
+  var left=row.offsetLeft,top=row.offsetTop,width=row.offsetWidth,height=row.offsetHeight,now=Date.now();
+  var snap=focusIndicator.hidden||!previousFocus||top!==previousFocus.top||
+    now-previousFocus.at<125||Math.abs(left-previousFocus.left)>width+64;
+  focusIndicator.classList.toggle('snap',snap);
+  focusIndicator.style.width=width+'px';
+  focusIndicator.style.height=height+'px';
+  focusIndicator.style.transform='translate('+left+'px,'+top+'px)';
+  previousFocus={row:row,left:left,top:top,width:width,height:height,at:now};
+  focusIndicator.hidden=false;
+}
+function resetCardHold(){
+  clearTimeout(holdTimer);
+  holdTimer=null;heldCard=null;holdOpened=false;
+}
+function finishCardHold(event){
+  if(event.keyCode!==13||!heldCard)return;
+  event.preventDefault();event.stopImmediatePropagation();
+  var card=heldCard,opened=holdOpened;
+  resetCardHold();
+  if(!opened&&active&&!full&&document.activeElement===card)card.click();
 }
 function focusIndex(value){
-  if(!items.length){$(onlyFavorites||query?'guide-empty-search':'guide-search').focus();return;}
-  select(value);
-  var list=$('guide-list'),row=rows[index];
+  if(!items.length){$(homeMode||onlyFavorites||query?'guide-empty-search':'guide-search').focus();return;}
+  var next=Math.max(0,Math.min(items.length-1,value));
+  var list=$('guide-list'),row=rows[next];
+  var start=homeMode?'scrollLeft':'scrollTop',space=homeMode?list.clientWidth:list.clientHeight;
   if(document.activeElement!==row){
     try{row.focus({preventScroll:true});}catch(e){row.focus();}
   }
-  var start=homeMode?'scrollLeft':'scrollTop',offset=homeMode?row.offsetLeft:row.offsetTop;
-  var length=homeMode?row.offsetWidth:row.offsetHeight,space=homeMode?list.clientWidth:list.clientHeight;
+  select(next);
+  var measured=previousFocus&&previousFocus.row===row?previousFocus:null;
+  var offset=homeMode?(measured?measured.left:row.offsetLeft):(measured?measured.top:row.offsetTop);
+  var length=homeMode?(measured?measured.width:row.offsetWidth):(measured?measured.height:row.offsetHeight);
   if(offset<list[start])list[start]=offset;
   else if(offset+length>list[start]+space)list[start]=offset+length-space;
 }
 function render(keep,focusId) {
   var list=$('guide-list');
   var nextItems=onlyFavorites||homeMode?favoriteCards():sourceItems;
-  var unchanged=rendered&&rendered.items===nextItems&&rendered.home===homeMode&&rendered.favorites===favorites&&rendered.channels===cachedItems;
+  var signature=renderSignature(nextItems);
+  var unchanged=rendered&&rendered.items===nextItems&&rendered.home===homeMode&&rendered.favorites===favorites&&rendered.channels===cachedItems&&rendered.signature===signature;
   items=nextItems;
   if(keep){var kept=savedChannel(keep),found=items.findIndex(function(i){return i.id===keep||kept&&channelKey(i)===channelKey(kept);});if(found>=0)index=found;}
   index=Math.max(0,Math.min(index,items.length-1));
   if(!unchanged){
-    var fragment=document.createDocumentFragment();
-    rows=[];selectedRow=null;
-    items.forEach(function(item,i){
-      var b=button('', '',fragment,function(){select(i);play(false);});
-      var favorite=saved(item.id);
-      b.className='guide-channel'; b.setAttribute('role','option');b.setAttribute('aria-selected','false');
-      b.setAttribute('aria-label',item.name+(favorite?', en favoritos':''));
-      var art=node('span','','',b,'channel-art');
-      var hasLogo=channelBrand(item,art,true);
-      if(hasLogo)b.classList.add('with-channel-logo');
-      if(favorite)node('span','','★',b,'channel-favorite').setAttribute('aria-hidden','true');
-      var text=node('span','','',b,'channel-text');
-      if(hasLogo)node('strong','',item.name,text);
-      var count=channelLinks(item).length;
-      if(count>1)node('small','',count+' enlaces',text);
-      b.onfocus=function(){select(i);}; rows.push(b);
-    });
-    if(homeMode&&items.length)button('guide-add-favorite','＋  Buscar canales',fragment,showSearch).className='guide-channel guide-add';
-    list.textContent='';list.appendChild(fragment);
+    var fragment=document.createDocumentFragment(),cachedIndex=-1;
+    if(rendered){
+      if(selectedRow){selectedRow.classList.remove('selected');selectedRow.setAttribute('aria-selected','false');}
+      rendered.rows=rows.slice();rendered.nodes=Array.prototype.slice.call(list.children);
+      renderCache.unshift(rendered);
+      var retained=0,views=0;
+      renderCache=renderCache.filter(function(view){
+        if(view.favorites!==favorites||view.channels!==cachedItems||!view.rows.length||views>=3||retained+view.rows.length>150)return false;
+        retained+=view.rows.length;views++;return true;
+      });
+    }
+    for(var ri=0;ri<renderCache.length;ri++){
+      var view=renderCache[ri];
+      if(view.items===nextItems&&view.home===homeMode&&view.favorites===favorites&&view.channels===cachedItems&&view.signature===signature){cachedIndex=ri;break;}
+    }
+    previousFocus=null;if(focusIndicator)focusIndicator.hidden=true;
+    list.textContent='';rows=[];selectedRow=null;
+    if(cachedIndex>=0){
+      rendered=renderCache.splice(cachedIndex,1)[0];rows=rendered.rows;focusIndicator=rendered.indicator;
+      rendered.nodes.forEach(function(child){fragment.appendChild(child);});
+      list.appendChild(fragment);
+    }else{
+      items.forEach(function(item,i){
+        var b=button('', '',fragment,function(){select(i);play(false);});
+        var favorite=saved(item.id);
+        b.className='guide-channel'+(favorite?' is-favorite':''); b.setAttribute('role','option');b.setAttribute('aria-selected','false');
+        b.setAttribute('aria-label',item.name+(favorite?', en favoritos':''));
+        var art=node('span','','',b,'channel-art');
+        var hasLogo=channelBrand(item,art,true);
+        if(hasLogo)b.classList.add('with-channel-logo');
+        if(favorite)node('span','','★',b,'channel-favorite').setAttribute('aria-hidden','true');
+        var text=node('span','','',b,'channel-text');
+        if(hasLogo)node('strong','',item.name,text);
+        b.onfocus=function(){showCardFocus(b);select(i);};
+        b.onblur=function(event){
+          if(rows.indexOf(event.relatedTarget)>=0)return;
+          var indicator=focusIndicator;
+          setTimeout(function(){
+            if(indicator&&indicator===focusIndicator&&rows.indexOf(document.activeElement)<0)indicator.hidden=true;
+          },0);
+        };
+        rows.push(b);
+      });
+      if(homeMode&&items.length)button('guide-add-favorite','＋  Buscar canales',fragment,showSearch).className='guide-channel guide-add';
+      focusIndicator=node('span','','',fragment,'guide-focus-indicator');
+      focusIndicator.hidden=true;focusIndicator.setAttribute('aria-hidden','true');
+      list.appendChild(fragment);
+    }
+    rendered={items:items,home:homeMode,favorites:favorites,channels:cachedItems,signature:signature,rows:rows.slice(),nodes:Array.prototype.slice.call(list.children),indicator:focusIndicator};
     list.scrollLeft=0;list.scrollTop=0;
-    rendered={items:items,home:homeMode,favorites:favorites,channels:cachedItems};
   }
   $('guide-empty').hidden=items.length>0;
   $('guide-empty-title').textContent=onlyFavorites||homeMode?'Tu lista empieza aquí':'No encontramos ese canal';
@@ -364,7 +493,7 @@ function render(keep,focusId) {
   heading();if(items.length){select(index);updateCount();}else details();
   if(focusId&&$(focusId)&&!$(focusId).disabled)$(focusId).focus();
   else if(items.length)focusIndex(index);
-  else $(onlyFavorites||query?'guide-empty-search':'guide-search').focus();
+  else $(homeMode||onlyFavorites||query?'guide-empty-search':'guide-search').focus();
 }
 function searchVisible(value) {
   $('guide-searchbox').hidden=!value; root.classList.toggle('search-open',value);
@@ -398,7 +527,7 @@ function load(focusLast,keep){
   status(items.length?'Selecciona un canal y pulsa OK para verlo.':cachedItems.length?'No hay resultados entre tus canales guardados.':'Pulsa Añadir un canal para empezar.');
 }
 
-function section(name){searchVisible(false);$('guide-query').blur();query='';genre='';$('guide-query').value='';page=0;index=0;homeMode=name==='guide-home';onlyFavorites=name==='guide-favorites';sport=name==='guide-sport';lastSection=name;$(name).focus();load();}
+function section(name,reopen){searchVisible(false);$('guide-query').blur();query='';genre='';$('guide-query').value='';page=0;index=0;homeMode=name==='guide-home';onlyFavorites=name==='guide-favorites';sport=name==='guide-sport';lastSection=name;if(reopen){open();return;}$(name).focus();load();}
 function toggleFavorite(override) {
   if(!libraryReady){status('No se pueden guardar cambios hasta recuperar el almacenamiento.');return false;}
   var item=override&&typeof override.id==='string'?override:items[index];if(!item)return;
@@ -407,6 +536,7 @@ function toggleFavorite(override) {
   try{localStorage.setItem('ace-tv.favorites',JSON.stringify(next));}
   catch(e){status('No se han podido guardar los favoritos. Inténtalo otra vez.');if(full&&AceTV.notify)AceTV.notify('No se han podido guardar los favoritos. Inténtalo otra vez.');return false;}
   favorites=next;
+  invalidateCatalogViews();
   var focus=document.activeElement&&document.activeElement.id;
   if(homeMode||onlyFavorites)render(item.id,focus==='guide-star'?'guide-star':null);
   else {
@@ -421,13 +551,20 @@ function play(force) {
   var item=items[index];if(!item)return;
   var phase=AceTV.diagnostics().phase;
   if(!force&&current&&current.id===item.id&&(phase==='playing'||phase==='paused')){fullscreen(true);return;}
-  startChannel(item);
+  startChannel(workingChannel(item));
 }
 function startChannel(item){
   current={id:item.id,name:item.name,kind:item.kind||'infohash'};
   fullscreen(true);
   $('source').value=current.kind+':'+current.id;
   AceTV.play();
+}
+function selectAlternateSource(){
+  var item=alternateChannel();
+  if(!item)return false;
+  current={id:item.id,name:item.name,kind:item.kind||'infohash'};
+  $('source').value=current.kind+':'+current.id;
+  return true;
 }
 function alternateChannel(){
   if(!current)return null;
@@ -483,8 +620,14 @@ function guideActions(){
 }
 function keys(e){
   var k=e.keyCode,focused=document.activeElement,id=focused&&focused.id;
+  if(heldCard&&!holdOpened)resetCardHold();
   if(!active){if((k===10009||k===27)&&AceTV.diagnostics().phase==='idle'){e.preventDefault();e.stopImmediatePropagation();open();}return;}
-  if((k===406||k===10190||k===80)&&focused.tagName!=='INPUT'){
+  if(!$('guide-searchbox').hidden&&!$('guide-searchbox').contains(focused)){
+    if(k===27||k===10009){e.preventDefault();e.stopImmediatePropagation();searchVisible(false);$('guide-search').focus();}
+    else if(k!==9){e.preventDefault();e.stopImmediatePropagation();$('guide-query').focus();}
+    return;
+  }
+  if($('guide-searchbox').hidden&&(k===406||k===10190||k===80)&&focused&&focused.tagName!=='INPUT'){
     e.preventDefault();e.stopImmediatePropagation();if(!e.repeat)playPrevious();return;
   }
   if(full){if(k===405&&current){e.preventDefault();e.stopImmediatePropagation();toggleFavorite(current);}else if(k===10009||k===27){e.preventDefault();e.stopImmediatePropagation();fullscreen(false);}else if(k===427||k===428||k===38||k===40){e.preventDefault();e.stopImmediatePropagation();zap(k===427||k===40?1:-1);}return;}
@@ -493,10 +636,24 @@ function keys(e){
     else if(k===10009||k===27||k===65385){e.preventDefault();searchVisible(false);$('guide-search').focus();}
     else if(k===40){e.preventDefault();$('guide-search-submit').focus();}return;}
   if([13,27,37,38,39,40,10009,405,427,428].indexOf(k)<0)return;e.preventDefault();
-  if(k===405){toggleFavorite();return;}if(k===427||k===428){zap(k===427?1:-1);return;}
+  if(id!=='guide-search-submit'&&id!=='guide-search-clear'){
+    if(k===405){toggleFavorite();return;}
+    if(k===427||k===428){zap(k===427?1:-1);return;}
+  }
   var nav=sidebar(),at=nav.indexOf(id),categoryIds=['category-football','category-sport','category-movies','category-news'],cat=categoryIds.indexOf(id);
   if(k===10009||k===27){if(!$('guide-searchbox').hidden){searchVisible(false);$('guide-search').focus();}else if(at<0)$(lastSection).focus();else if(!homeMode)section('guide-home');else if(window.tizen)tizen.application.getCurrentApplication().exit();return;}
-  if(k===13){if(focused&&!focused.disabled)focused.click();return;}
+  if(k===13){
+    if(!focused||focused.disabled)return;
+    if(!e.isTrusted||rows.indexOf(focused)<0||!window.AceLibraryUI){focused.click();return;}
+    if(e.repeat)return;
+    heldCard=focused;
+    holdTimer=setTimeout(function(){
+      if(!active||full||document.activeElement!==heldCard){resetCardHold();return;}
+      holdOpened=true;
+      AceLibraryUI.open('channel');
+    },550);
+    return;
+  }
   if(at>=0){if(k===37)$(nav[Math.max(0,at-1)]).focus();if(k===39)$(nav[Math.min(nav.length-1,at+1)]).focus();if(k===40){if(!$('guide-searchbox').hidden)$('guide-query').focus();else if(items.length)focusAction('guide-watch');else $('guide-empty-search').focus();}return;}
   var row=rows.indexOf(focused),cols=homeMode?Math.max(1,rows.length):5;
   if(row>=0){
@@ -547,7 +704,7 @@ function build(){
   var nav=node('nav','','',header,'guide-nav');nav.setAttribute('aria-label','Secciones');button('guide-home','Inicio',nav,function(){section('guide-home')});button('guide-live','En directo',nav,function(){section('guide-live')});button('guide-sport','Deportes',nav,function(){section('guide-sport')});button('guide-favorites','Mis favoritos',nav,function(){section('guide-favorites')});
   var tools=node('div','','',header,'guide-tools');button('guide-search','⌕  Buscar',tools,function(){if($('guide-searchbox').hidden)showSearch();else submitSearch()});button('guide-reload','＋',tools,options).setAttribute('aria-label','Añadir un canal');button('guide-options','⚙',tools,options).setAttribute('aria-label','Ajustes');node('span','guide-clock','',tools);
   function clock(){var d=new Date();$('guide-clock').textContent=('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2)}clock();if(typeof setInterval==='function')setInterval(function(){if(!document.hidden&&!root.hidden)clock();},30000);
-  var content=node('main','','',root,'guide-content');var hero=node('section','','',content,'guide-hero');var meta=node('div','','',hero,'guide-hero-meta');node('p','guide-kicker','EN DIRECTO',meta);node('div','guide-hero-brand','',meta);node('h1','guide-title','',hero);node('p','guide-description','',hero);
+  var content=node('main','','',root,'guide-content');var hero=node('section','','',content,'guide-hero');var meta=node('div','','',hero,'guide-hero-meta');node('p','guide-kicker','TUS ENLACES',meta);node('div','guide-hero-brand','',meta).hidden=true;node('h1','guide-title','',hero);node('p','guide-description','',hero);
   var actions=node('div','','',hero,'guide-actions');button('guide-watch','▶  Ver canal',actions,function(){play(false)});button('guide-star','☆  Añadir a favoritos',actions,toggleFavorite);button('guide-links','Enlaces',actions,function(){if(window.AceLibraryUI)AceLibraryUI.open('links');});button('guide-library','⋯  Recientes y opciones',actions,function(){if(window.AceLibraryUI)AceLibraryUI.open();});
   var searchbox=node('div','guide-searchbox','',content);searchbox.hidden=true;var input=node('input','guide-query','',searchbox);input.type='search';input.maxLength=80;input.placeholder='¿Qué canal quieres ver?';input.setAttribute('aria-label','Nombre del canal');button('guide-search-submit','Buscar',searchbox,submitSearch);button('guide-search-clear','Borrar',searchbox,function(){input.value='';submitSearch();});
   var library=node('section','','',content,'guide-library');var line=node('div','','',library,'guide-section-top');node('h2','guide-heading','Mis favoritos',line);node('span','guide-breadcrumb','',line);node('span','guide-count','',line);
@@ -555,14 +712,21 @@ function build(){
   var list=node('div','guide-list','',library);list.setAttribute('role','listbox');list.setAttribute('aria-label','Canales');
   var categories=node('section','guide-categories','',content);node('h2','','Explora tus canales',categories);var tiles=node('div','','',categories,'category-list');[['football','Fútbol'],['sport','Deportes'],['movies','Cine'],['news','Noticias']].forEach(function(c){button('category-'+c[0],c[1],tiles,function(){openCategory(c[0])}).className='category-card category-'+c[0]});
   var pages=node('div','guide-page','',content,'guide-page');button('guide-prev','←  Anterior',pages,function(){turnPage(-1)});button('guide-next','Siguiente  →',pages,function(){turnPage(1)});
-  var footer=node('footer','','',root,'guide-footer');node('p','guide-status','Preparando canales…',footer).setAttribute('role','status');node('span','','OK · Ver  |  Amarillo · Favorito  |  Azul · Anterior  |  CH+/− · Canal  |  Atrás · Volver',footer,'guide-help');document.addEventListener('keydown',keys,true);
+  var footer=node('footer','','',root,'guide-footer');node('p','guide-status','Preparando canales…',footer).setAttribute('role','status');node('span','','OK · Ver  |  Mantén OK · Opciones  |  Atrás · Volver',footer,'guide-help');document.addEventListener('keydown',keys,true);
 }
 
+if(typeof window.addEventListener==='function'){
+  window.addEventListener('keydown',function(e){
+    if(e.keyCode===13&&heldCard){e.preventDefault();e.stopImmediatePropagation();}
+  },true);
+  window.addEventListener('keyup',finishCardHold,true);
+  window.addEventListener('blur',resetCardHold);
+}
 $('explore').onclick=open;$('backguide').onclick=open;
 if(typeof window.addEventListener==='function')window.addEventListener('resize',size);
-document.addEventListener('visibilitychange',function(){if(document.hidden){clearTimeout(cursorTimer);writeCursor();clearTimeout(zapTimer);zapTimer=null;}else if(active){fullscreen(false);if(!items.length)load();}});
-window.AceGuide={cancelPlayback:cancelPlayback,hasAlternate:function(){return !!alternateChannel();},tryAlternate:tryAlternate,preparePlayback:function(){if(active&&current)fullscreen(true);},currentName:function(){return current?current.name:($('channel-name')&&$('channel-name').value||"Tu canal");},open:open,status:status,onPlayer:playerPhase,isPreview:function(){return false;}};
-window.AceCatalog={libraryState:libraryState,preferLink:preferLink,moveFavorite:libraryMove,editChannel:libraryEdit,deleteChannel:libraryDelete,playSaved:libraryPlay,restoreFocus:function(){focusIndex(index);},addChannel:addChannel,previewM3U:function(text){return importM3U(text,false);},importM3U:function(text){return importM3U(text,true);},showImported:function(message){open();section('guide-live');status(message);},addLink:options,suggestions:function(){return uniqueChannels(cachedItems).slice(0,18).map(function(i){return {id:i.id,name:i.name};});},isFavorite:saved,toggleFavorite:function(id){var item=cachedItems.find(function(i){return i.id===id;});return item?toggleFavorite(item):false;},finishSetup:function(search){open();section(favorites.length?'guide-home':'guide-live');if(search)showSearch();},open:open,close:options,search:function(text){if(!active||full)open();$('guide-query').value=String(text).slice(0,80);submitSearch();},diagnostics:function(){return {open:active,fullscreen:full,loading:false,page:page,items:items.length,cachedChannels:cachedItems.length,favorites:favoriteCards().length,index:index,current:!!current,section:homeMode?'home':onlyFavorites?'favorites':sport?'sport':query?'search':genre||'live'};}};
+document.addEventListener('visibilitychange',function(){if(document.hidden){resetCardHold();clearTimeout(cursorTimer);writeCursor();clearTimeout(zapTimer);zapTimer=null;}else if(active&&!(AceTV.hasPendingResume&&AceTV.hasPendingResume())){fullscreen(false);if(!items.length)load();}});
+window.AceGuide={cancelPlayback:cancelPlayback,hasAlternate:function(){return !!alternateChannel();},tryAlternate:tryAlternate,selectAlternateSource:selectAlternateSource,preparePlayback:function(){if(active&&current)fullscreen(true);},currentName:function(){return current?current.name:($('channel-name')&&$('channel-name').value||"Tu canal");},open:open,status:status,onPlayer:playerPhase,isPreview:function(){return false;}};
+window.AceCatalog={libraryState:libraryState,preferLink:preferLink,moveFavorite:libraryMove,editChannel:libraryEdit,deleteChannel:libraryDelete,playSaved:libraryPlay,restoreFocus:function(){focusIndex(index);},addChannel:addChannel,previewM3U:function(text){return importM3U(text,false);},importM3U:function(text){return importM3U(text,true);},showImported:function(message){section('guide-live',true);status(message);},addLink:options,suggestions:function(){return uniqueChannels(cachedItems).slice(0,18).map(function(i){return {id:i.id,name:i.name};});},isFavorite:saved,toggleFavorite:function(id){var item=cachedItems.find(function(i){return i.id===id;});return item?toggleFavorite(item):false;},finishSetup:function(search){open();section(favorites.length?'guide-home':'guide-live');if(search)showSearch();},open:open,close:options,search:function(text){if(!active||full)open();$('guide-query').value=String(text).slice(0,80);submitSearch();},diagnostics:function(){return {open:active,fullscreen:full,loading:false,page:page,items:items.length,cachedChannels:cachedItems.length,favorites:favoriteCards().length,index:index,current:!!current,section:homeMode?'home':onlyFavorites?'favorites':sport?'sport':query?'search':genre||'live'};}};
 if(savedCursor&&typeof savedCursor==='object'&&['home','favorites','live','sport','football','movies','news'].indexOf(savedCursor.view)>=0){
   homeMode=savedCursor.view==='home';
   onlyFavorites=savedCursor.view==='favorites';

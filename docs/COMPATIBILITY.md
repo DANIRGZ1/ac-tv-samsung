@@ -24,3 +24,7 @@ Si la instalación falla, empieza por el [diagnóstico de conexión](INSTALL.md#
 Comparte los resultados en [GitHub Issues](https://github.com/DANIRGZ1/ac-tv-samsung/issues/new/choose). Indica modelo comercial, versión de software de la TV, versión de AC TV y el tipo de prueba que hiciste. Omite números de serie, direcciones IP, certificados, enlaces Ace Stream y listas personales.
 
 Para resolver fallos habituales, consulta la [guía de solución de problemas](TROUBLESHOOTING.md).
+
+## Beta pública 0.15.1
+
+La compilación y las pruebas automatizadas cubren el inicio con la biblioteca vacía, la importación M3U, la navegación con el mando, la reconexión y la restauración de la biblioteca. Sigue pendiente validar en la beta pública la reproducción P2P prolongada y el regreso tras apagar y encender físicamente la TV.

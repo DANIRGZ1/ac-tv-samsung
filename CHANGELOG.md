@@ -1,5 +1,12 @@
 # Historial de versiones
 
+## 0.15.1
+
+- Progreso discreto al abrir un canal y mensajes distintos si falta conexión, no hay emisores o el formato no es compatible.
+- Reconexión limitada, una alternativa automática guardada y recuperación al volver a la aplicación.
+- Diagnóstico con informe copiable y copia local de la biblioteca tras actualizar. Puedes restaurarla y deshacer la restauración.
+- Navegación más ligera mediante reutilización de tarjetas y ajustes de foco y texto para el mando.
+
 ## 0.15.0
 
 - Primera beta abierta para quienes quieran probar AC TV en su Samsung.

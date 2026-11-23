@@ -39,6 +39,11 @@ async function main() {
     await open();
     const card = await page.locator('.m3u-card').boundingBox();
     assert(card && card.y >= 0 && card.y + card.height <= 721, 'dialog fits at 720p');
+    await key(40);
+    assert.equal(await page.evaluate(() => document.activeElement.id), 'm3u-text', 'Down follows the field below Choose');
+    await key(10009);
+    assert.equal(await page.evaluate(() => document.activeElement.id), 'm3u-preview', 'Back from text returns to preview');
+    assert.equal(await page.locator('#m3u-cancel').evaluate(e => getComputedStyle(e).backgroundColor), 'rgb(38, 53, 33)');
     await page.locator('#m3u-text').fill(list);
     await page.locator('#m3u-preview').click();
     assert.equal(await count(), 1, 'preview does not write');

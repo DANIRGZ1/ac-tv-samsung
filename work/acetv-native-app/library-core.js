@@ -6,7 +6,7 @@
   'use strict';
 
   const JOURNAL = 'ace-tv.library-journal.v1';
-  const KEYS = new Set(['ace-tv.channels', 'ace-tv.favorites', 'ace-tv.recent']);
+  const KEYS = new Set(['ace-tv.channels', 'ace-tv.favorites', 'ace-tv.recent', 'ace-tv.working-links.v1', 'ace-tv.library-recovery.snapshot.v1', 'ace-tv.library-recovery.version.v1']);
   const validId = value => typeof value === 'string' && /^[a-f0-9]{40}$/i.test(value);
 
   function normalize(list, limit = 12) {

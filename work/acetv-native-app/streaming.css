@@ -28,9 +28,59 @@
 .home-view #guide-list{display:flex;overflow-x:auto;overflow-y:hidden;padding-top:8px;padding-bottom:12px}.home-view #guide-list .guide-channel{width:calc((100% - 80px)/5);flex:0 0 calc((100% - 80px)/5)}
 #tvguide .guide-add{border-style:dashed!important;color:#a0ff32!important;text-align:center!important;align-items:center!important;font-size:25px!important;font-weight:600;line-height:1.4}
 #guide-categories{margin-top:24px}#guide-categories h2{line-height:38px;margin-bottom:15px}.category-list{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:20px}
-#tvguide .category-card{position:relative;height:160px;text-align:left;display:flex;align-items:flex-end;padding:22px 25px;font-size:35px;font-weight:700;border-radius:16px;border:1px solid #4e5857;overflow:hidden;background-image:linear-gradient(0deg,rgba(0,0,0,.7),rgba(0,0,0,.1)),url('assets/categories.jpg');background-size:100% 100%,200% 200%;background-repeat:no-repeat;box-shadow:none}
-#tvguide .category-football{background-position:center,0% 0%}#tvguide .category-sport{background-position:center,100% 0%}#tvguide .category-movies{background-position:center,0% 100%}#tvguide .category-news{background-position:center,100% 100%}
-#tvguide .category-card:focus{outline:3px solid #a0ff32;outline-offset:3px;transform:scale(1.015)}
+#tvguide .category-card {
+  -webkit-appearance: none;
+  appearance: none;
+  position: relative;
+  z-index: 0;
+  height: 160px;
+  text-align: left;
+  display: flex;
+  align-items: flex-end;
+  padding: 22px 25px;
+  font-size: 35px;
+  font-weight: 700;
+  border-radius: 16px;
+  border: 1px solid #4e5857;
+  overflow: hidden;
+  background: #151b18;
+  box-shadow: none;
+  transform: none;
+  transition: none;
+}
+#tvguide .category-card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: -1;
+  pointer-events: none;
+  background-image: linear-gradient(0deg, rgba(0,0,0,.7), rgba(0,0,0,.1)), url('assets/categories.jpg');
+  background-size: 100% 100%, 200% 200%;
+  background-repeat: no-repeat;
+  transition: transform .16s ease-out;
+}
+#tvguide .category-football::before { background-position: center, 0% 0%; }
+#tvguide .category-sport::before { background-position: center, 100% 0%; }
+#tvguide .category-movies::before { background-position: center, 0% 100%; }
+#tvguide .category-news::before { background-position: center, 100% 100%; }
+#tvguide .category-card:focus {
+  background: #151b18;
+  color: #f5f6f7;
+  box-shadow: none;
+  transform: none;
+  outline: 3px solid #a0ff32;
+  outline-offset: 3px;
+}
+#tvguide .category-card:focus::before,
+#tvguide .category-card:hover::before { transform: scale(1.045); }
+@media (prefers-reduced-motion: reduce) {
+  #tvguide .category-card::before { transition: none; }
+  #tvguide .category-card:focus::before,
+  #tvguide .category-card:hover::before { transform: none; }
+}
 #guide-empty{position:relative;display:flex;flex-direction:column;justify-content:center;align-items:flex-start;min-height:176px;inset:auto;padding:24px 30px;background:#131918;border:1px solid #39453c;border-radius:18px;max-width:none;color:#fff}#guide-empty h3{font-size:29px;margin:0 0 8px}#guide-empty p{font-size:23px;margin:0 0 14px;color:#b4c1b7}#guide-empty-search{font-size:23px;color:#10150c!important;background:#a0ff32!important;border-radius:9px;padding:12px 22px}#guide-empty-search:focus{outline:3px solid white;outline-offset:4px}
 #guide-searchbox{position:absolute;z-index:6;left:0;right:0;top:8px;display:flex;align-items:center;gap:16px;background:#151c18;border:2px solid #59744d;border-radius:17px;padding:20px;box-shadow:0 18px 60px #000a}#guide-query{flex:1;height:66px;margin:0;background:#0b100d;color:#fff;border:1px solid #61735f;border-radius:10px;font-size:27px;padding:15px 22px}#guide-query:focus{outline:3px solid #a0ff32;border-color:#a0ff32}#guide-search-submit{height:66px;background:#a0ff32;color:#10150b!important;border-radius:11px;padding:14px 35px;font-size:25px;font-weight:700}#guide-search-submit:focus{outline:3px solid white;outline-offset:3px}
 .browse-view #guide-backdrop{opacity:.5}.browse-view .guide-hero{height:267px!important;padding-top:25px!important}.browse-view .guide-hero-meta{margin-bottom:12px;height:33px}.browse-view #guide-kicker{font-size:17px;padding:8px 10px}.browse-view #guide-hero-brand{display:none}.browse-view #guide-title{font-size:54px!important;line-height:1.05;margin-bottom:10px!important}.browse-view #guide-description{font-size:23px;line-height:29px}.browse-view .guide-actions{margin-top:17px!important}.browse-view .guide-actions button{min-height:55px;font-size:22px!important;padding:10px 24px!important}.browse-view #guide-list{height:518px}.browse-view .guide-channel{height:154px!important;min-height:154px!important;padding:18px!important}.browse-view .channel-art{height:70px;min-height:70px}.browse-view .channel-text{margin-top:6px}.browse-view .brand-generic{font-size:25px}
@@ -91,18 +141,32 @@
 #tvguide #guide-list .channel-text:empty,
 #tvguide #guide-list .guide-channel:not(.with-channel-logo) .channel-text strong { display: none; }
 #tvguide #guide-list .channel-text strong { font-size: 20px; }
-#tvguide #guide-list .channel-favorite { top: 7px; right: 12px; font-size: 23px; }
-#tvguide.browse-view #guide-title.long-title {
-  display: -webkit-box;
+#tvguide #guide-list .guide-channel.is-favorite {
+  background: linear-gradient(135deg, #403018, #221d14 55%, #151712);
+  border-color: #c29745;
+}
+#tvguide #guide-list .guide-channel.is-favorite.selected { border-color: #e2b65a; }
+#tvguide #guide-list .channel-favorite {
+  top: 7px;
+  right: 12px;
+  padding: 2px 8px;
+  border-radius: 12px;
+  background: #ffcf68;
+  color: #241a0b;
+  font-size: 20px;
+  line-height: 24px;
+}
+#tvguide .guide-hero { max-width: 1340px; }
+#tvguide #guide-title {
   max-width: 100%;
   white-space: normal;
-  word-wrap: break-word;
   overflow-wrap: anywhere;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-  font-size: 35px !important;
-  letter-spacing: -0.5px;
+  word-wrap: break-word;
+  font-size: 64px;
 }
+#tvguide #guide-title.long-title { font-size: 36px; letter-spacing: -0.5px; }
+#tvguide.browse-view #guide-title.long-title { font-size: 32px !important; }
+#tvguide.browse-view #guide-title.long-title + #guide-description { display: none; }
 #guide-heading { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 #guide-count { flex-shrink: 0; white-space: nowrap; margin-left: 24px; }
 #loading-channel, #library-content button, #library-content strong, #hud { overflow-wrap: anywhere; }
@@ -126,17 +190,19 @@
 }
 
 #tvguide .guide-header button { transition: none; }
-.guide-help { font-size: 18px; }
+#guide-status, .guide-help { font-size: 22px; }
+#guide-status { min-width: 0; }
+#tvguide .guide-help { flex-shrink: 0; }
 #panel .explore-card { background: linear-gradient(135deg,#263e32,#18251d 60%,#304536); }
 #panel .explore-kicker, #panel .explore-caption { color: #d0dfd3; }
 
+#tvguide .guide-actions { flex-wrap: wrap; gap: 12px 20px; }
 #tvguide .guide-actions button {
-  min-width: 0;
+  flex: 0 0 auto;
+  min-width: 148px;
   max-width: 100%;
   line-height: 1.2;
   white-space: normal;
-  word-wrap: break-word;
-  overflow-wrap: anywhere;
 }
 #tvguide .guide-actions #guide-watch { min-width: 190px; }
 #channel-library button,
@@ -156,3 +222,58 @@
 #channel-library .library-row { flex-shrink: 0; }
 #tvguide #guide-list .channel-art { min-width: 0; max-width: 100%; }
 #tvguide #guide-list .brand-generic { flex: 0 1 100%; min-width: 0; }
+
+/* Draw focus within the control so scroll containers cannot crop it. */
+#tvguide #guide-list .guide-channel:focus {
+  box-shadow: inset 0 0 0 2px #a0ff32, 0 4px 12px #0007;
+}
+#tvguide .guide-actions button,
+#channel-library button,
+#first-run button,
+#loading-actions button,
+#panel button { transition: none; }
+#tvguide .guide-actions button:focus,
+#panel button:focus { transform: none; }
+#tvguide .guide-actions button:focus,
+#channel-library button:focus,
+#library-backup button:focus {
+  outline: 0;
+  box-shadow: inset 0 0 0 3px #a0ff32;
+}
+#library-backup button {
+  background: #263521;
+  border: 1px solid #728368;
+  border-radius: 12px;
+  color: #f1f6ec;
+  transition: none;
+}
+#library-backup button:focus { background: #35482b; color: #f1f6ec; transform: none; }
+
+
+#tvguide #guide-list { position: relative; }
+#tvguide #guide-list .guide-focus-indicator {
+  position: absolute;
+  box-sizing: border-box;
+  top: 0;
+  left: 0;
+  z-index: 3;
+  pointer-events: none;
+  border: 3px solid #a0ff32;
+  border-radius: 20px;
+  transition: transform 125ms ease-out;
+}
+#tvguide #guide-list .guide-focus-indicator.snap { transition: none; }
+#tvguide #guide-list .guide-focus-indicator[hidden] { display: none; }
+#tvguide #guide-list .guide-channel:not(.guide-add):focus {
+  border-color: transparent;
+  box-shadow: none;
+  transform: none;
+}
+#channel-library[data-mode="channel"] #library-title { overflow-wrap: anywhere; }
+@media (prefers-reduced-motion: reduce) {
+  #tvguide #guide-list .guide-focus-indicator { transition: none; }
+}
+
+/* Keep the persistent loading exit styled outside the error-only actions. */
+#channel-loading #loading-back{display:inline-block;margin:24px 0 0;padding:16px 28px;min-height:54px;border:1px solid #526249;border-radius:12px;background:#283326;color:#eef5e8;font-family:inherit;font-size:clamp(20px,1.5vw,29px);line-height:1.25;cursor:pointer}
+#channel-loading #loading-back:focus{outline:3px solid #a0ff32;outline-offset:5px;background:#a0ff32;color:#10160b;transform:none}

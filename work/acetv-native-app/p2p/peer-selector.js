@@ -13,7 +13,7 @@
       progress(event);
     }
   }
-  function probe(descriptor, peer, progress, isCancelled) {
+  function probe(descriptor, peer, progress, isCancelled, deadline) {
     return new Promise(function (resolve) {
       var mod = root.Module, wire = null, ptr = 0, connected = false, closed = false;
       var connectStarted = Date.now(), windowStarted = 0, received = 0, sent = 0;
@@ -32,6 +32,7 @@
           if (closed) return;
           if (isCancelled()) return finish(null, 'cancelled');
           var now = Date.now();
+          if (now >= deadline) return finish(null,'probe budget exhausted');
           if (!connected) {
             if (now - connectStarted > CONNECT_MS) return finish(null,'connect timeout');
             var ready = mod._net_ready();
@@ -96,10 +97,11 @@
         try { return !!options.isCancelled(); } catch (_) { return true; }
       } : function () { return false; };
       var candidates = peers.slice(0, MAX_PEERS), usable = [];
-      var started = Date.now(), attemptedCount = 0;
+      var deadline = Date.now() + budgetMs, attemptedCount = 0;
       quiet(onProgress, 'probing', candidates.length, null, 0, candidates.length);
       for (var i = 0; i < candidates.length; i++) {
         if (isCancelled()) { quiet(onProgress, 'cancelled', usable.length, usable.length ? usable[0].head : null, i, candidates.length); break; }
+        if (Date.now() >= deadline) break;
         var peer = candidates[i];
         if (!peer || typeof peer.host !== 'string' || !Number.isInteger(peer.port) || peer.port < 1 || peer.port > 65535) continue;
         if(root.AceDiscovery&&root.AceDiscovery.isPublicIPv4&&!root.AceDiscovery.isPublicIPv4(peer.host))continue;
@@ -108,10 +110,10 @@
           if (typeof onProgress === 'function') onProgress(event);
         };
         attemptedCount = i + 1;
-        var result = await probe(descriptor, peer, progress, isCancelled);
+        var result = await probe(descriptor, peer, progress, isCancelled, deadline);
         if (isCancelled()) { quiet(onProgress, 'cancelled', usable.length, usable.length ? usable[0].head : null, i + 1, candidates.length); break; }
         if (result) usable.push(result);
-        if (usable.length >= maxUsable || (usable.length > 0 && Date.now() - started >= budgetMs)) break;
+        if (usable.length >= maxUsable) break;
       }
       usable.sort(function (a, b) { return b.head - a.head; });
       quiet(onProgress, 'complete', usable.length, usable.length ? usable[0].head : null, attemptedCount, candidates.length);

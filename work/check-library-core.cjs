@@ -57,4 +57,14 @@ assert.equal(core.recover(s), false);
 assert.equal(s.getItem(K), 'untouched');
 assert.notEqual(s.getItem(J), null);
 
+const W='ace-tv.working-links.v1';
+s=new FakeStorage({[K]:'old',[W]:'previous'});
+let workingWrites=0;
+s.fail=(key,op)=>key===W && op==='set' && ++workingWrites===1;
+assert.equal(core.commit(s,{[K]:'changed',[W]:'next'}),false);
+assert.equal(s.getItem(K),'old');
+assert.equal(s.getItem(W),'previous');
+s=new FakeStorage({[W]:'partial',[J]:JSON.stringify({v:1,before:{[W]:'previous'}})});
+assert.equal(core.recover(s),true);
+assert.equal(s.getItem(W),'previous');
 console.log('library-core checks passed');

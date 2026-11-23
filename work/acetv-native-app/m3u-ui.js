@@ -164,8 +164,12 @@
     }
     if (key !== 9 && (focused.id === 'm3u-text' || [37, 38, 39, 40].indexOf(key) < 0)) return;
     event.preventDefault();
+    if (key !== 9) {
+      window.AceSpatialFocus.move(dialog, key, focused);
+      return;
+    }
     var fields = Array.from(dialog.querySelectorAll('button:not(:disabled), textarea'));
-    var step = key === 37 || key === 38 || (key === 9 && event.shiftKey) ? -1 : 1;
+    var step = event.shiftKey ? -1 : 1;
     fields[(fields.indexOf(focused) + step + fields.length) % fields.length].focus();
   }, true);
 })();
