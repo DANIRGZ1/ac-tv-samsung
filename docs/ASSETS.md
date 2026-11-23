@@ -10,3 +10,5 @@ Para regenerar el icono y la portada con Chrome instalado, ejecuta `npm ci` y `n
 - `docs/images/`: capturas y composición de portada con interfaz y datos sintéticos. Los nombres de demostración incluyen “Fútbol1” y “Campeones1”; los IDs no son funcionales.
 
 La versión pública no incluye logotipos de canales ni recursos promocionales de TV de pago. Las imágenes de galería no prueban disponibilidad de contenidos ni representan canales reales.
+
+- La [cabecera del README](brand/readme-cover.html) y sus dos capturas se regeneran con Chrome y `node work/render-readme.cjs`. Las capturas usan la interfaz pública y datos ficticios. El progreso de conexión se simula localmente.

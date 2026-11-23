@@ -1,12 +1,11 @@
-<p align="center"><img src="docs/images/cover.png" alt="AC TV para Samsung Tizen" width="100%"></p>
+<p align="center"><img src="docs/images/readme-cover.jpg" alt="AC TV para Samsung Tizen" width="100%"></p>
 
 <h1 align="center">AC TV para Samsung</h1>
-<p align="center"><strong>Tus enlaces, tus favoritos y el mando de tu Samsung.</strong></p>
-<p align="center">Beta abierta de un reproductor de enlaces Ace Stream para Samsung Tizen. Una vez instalado, el motor integrado reproduce desde la tele con AVPlay.</p>
+<p align="center">Reproduce tus enlaces Ace Stream, importa listas M3U y navega con el mando de la tele.</p>
 
 <p align="center">
-  <img alt="Versión pública 0.15.1" src="https://img.shields.io/badge/versi%C3%B3n-0.15.1-A0FF32?labelColor=182016">
-  <img alt="Samsung Tizen" src="https://img.shields.io/badge/Samsung-Tizen-91B8DF?labelColor=182016">
+  <img alt="Versión pública 0.15.1" src="https://img.shields.io/badge/beta-0.15.1-A0FF32?labelColor=182016">
+  <img alt="Samsung Tizen" src="https://img.shields.io/badge/Samsung-Tizen-687665?labelColor=182016">
   <a href="LICENSE"><img alt="Licencia AGPL 3.0" src="https://img.shields.io/badge/licencia-AGPL--3.0-CCCCCC?labelColor=182016"></a>
 </p>
 
@@ -16,11 +15,26 @@
 
 ## Qué puedes hacer
 
-| Añade tus enlaces | Encuentra lo que guardaste | Reproduce con el mando |
-| --- | --- | --- |
-| Guarda un enlace o importa varios desde una lista M3U de Ace Stream. Puedes cambiar el nombre o el enlace más tarde. | Busca por nombre, ordena tus favoritos y vuelve a los últimos 12 canales reproducidos. | Navega con las flechas, abre con **OK** y cambia de canal con **CH+/CH−**. |
+| Listas M3U | Conexión en directo | Copia de biblioteca |
+| :--- | :--- | :--- |
+| Importa tus enlaces Ace Stream, búscalos por nombre y guarda tus favoritos. | Consulta el progreso al abrir un canal. Si falla una fuente, AC TV puede probar otro enlace guardado. | Guarda una copia local al actualizar. Puedes restaurarla y deshacer la restauración. |
 
-**Nuevo en 0.15.1.** AC TV muestra el progreso de conexión, puede probar una fuente alternativa guardada cuando falla la principal y guarda una copia de la biblioteca tras actualizar. [Ver la guía de canales y favoritos](docs/LIBRARY.md)
+[Leer la guía de canales y favoritos](docs/LIBRARY.md)
+
+## Galería
+
+<table>
+  <tr>
+    <th width="50%">Explora tus canales</th>
+    <th width="50%">Abriendo canal</th>
+  </tr>
+  <tr>
+    <td><a href="docs/images/readme-home.jpg"><img src="docs/images/readme-home.jpg" alt="Inicio de AC TV con favoritos y categorías" width="100%"></a></td>
+    <td><a href="docs/images/readme-loading.jpg"><img src="docs/images/readme-loading.jpg" alt="Pantalla de carga con el mensaje Buscando conexiones P2P" width="100%"></a></td>
+  </tr>
+</table>
+
+*Capturas de la interfaz con canales ficticios. El progreso de conexión está simulado.* [Ver todas las pantallas](docs/GALLERY.md)
 
 ## Instalación
 
@@ -37,23 +51,6 @@
 ## Prueba la beta
 
 Comprueba si puedes instalar, importar una lista M3U de prueba y navegar con el mando. Si pruebas la reproducción, usa un enlace autorizado y comprueba la imagen, el sonido y la opción de volver al catálogo con **Atrás**. Comparte el modelo, la versión de software y el paso que has podido comprobar. [Plantilla de compatibilidad](.github/ISSUE_TEMPLATE/compatibilidad.md) · [Resultados verificados](docs/COMPATIBILITY.md)
-
-## Galería
-
-![Pantalla de inicio de AC TV](docs/images/home.png)
-
-<table>
-  <tr>
-    <td width="50%"><strong>Explora tus canales</strong><br><img src="docs/images/channels.png" alt="Biblioteca de demostración" width="100%"></td>
-    <td width="50%"><strong>Busca por nombre</strong><br><img src="docs/images/search-results.png" alt="Resultados de búsqueda de demostración" width="100%"></td>
-  </tr>
-  <tr>
-    <td><strong>Ordena tus favoritos</strong><br><img src="docs/images/order-favorites.png" alt="Orden de favoritos con el mando" width="100%"></td>
-    <td><strong>Añade tu propio enlace</strong><br><img src="docs/images/add-link.png" alt="Formulario de alta de un canal" width="100%"></td>
-  </tr>
-</table>
-
-*Capturas de escritorio con datos ficticios. «Fútbol1» y «Campeones1» son ejemplos de interfaz.* [Ver todas las pantallas](docs/GALLERY.md)
 
 ## Preguntas frecuentes
 
